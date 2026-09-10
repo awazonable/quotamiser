@@ -162,8 +162,8 @@ CREATE TABLE pool_epoch (
 ) STRICT;
 
 CREATE TABLE reservation (
-    id          TEXT PRIMARY KEY,
-    root_id     TEXT    NOT NULL,
+    id          INTEGER PRIMARY KEY,
+    root_id     INTEGER NOT NULL,
     pool_id     TEXT    NOT NULL,
     epoch       INTEGER NOT NULL,
     state       TEXT    NOT NULL CHECK (state IN
@@ -180,8 +180,15 @@ CREATE TABLE reservation (
     accounting_rev   INTEGER NOT NULL,
     created_at  INTEGER NOT NULL,
     UNIQUE (root_id, epoch),
-    CHECK (state <> 'SETTLED' OR settled IS NOT NULL),
-    CHECK (state IN ('DISPATCHED_WITH_ID','SETTLED') OR response_id IS NULL)
+    -- settled は SETTLED のときだけ、かつ必ず存在する。
+    CHECK ((state = 'SETTLED') = (settled IS NOT NULL)),
+    -- response_id は DISPATCHED_WITH_ID で必須、そこから至る終端状態では残ってよく、
+    -- 送信前の状態では存在しない。
+    CHECK (CASE
+             WHEN state = 'DISPATCHED_WITH_ID' THEN response_id IS NOT NULL
+             WHEN state IN ('SETTLED','CONSUMED_UNRECOVERABLE') THEN 1
+             ELSE response_id IS NULL
+           END)
 ) STRICT;
 
 CREATE TABLE ledger_meta (
@@ -386,3 +393,31 @@ Usage API は**ドリフトの検出にのみ**用いる。`台帳.consumed` が
 - 受理範囲は allowlist であり、拡張時に「拒否リストへの追加漏れ」が起きない構造にする。
 - credential は 2 種（推論用・Admin）。Admin key は Usage API 照会にのみ使い、推論経路から到達不能にする。
 - ログに credential とプロンプト本文を残さない。トークン数と識別子のみを記録する。
+
+## 実装の現状
+
+### 台帳（`crates/ledger`）— 実装済み
+
+予約台帳・状態遷移・ロールオーバ・起動時の信頼判定・外部 HWM・ロックを実装した。ネットワークに依存しないクレートとして分離しており、送信経路を構造的に持たない。
+
+実装で確定した点:
+
+- **状態遷移はすべて群単位で適用する。** 本書の表で「当該エポック」としていた遷移も含む。引き継ぎ行の状態が食い違う余地を構造的に消すため。
+- `reservation.id` と `root_id` は整数とした。
+- **スキーマの `response_id` 制約を修正した。** 当初の制約は `DISPATCHED_WITH_ID` から回収不能に至った行（`response_id` を保持している）を拒否していた。
+- ラッチのスコープは `global` / Pool id / `model:<snapshot>`。上限超過はモデルを、検証を通らない usage は Pool をラッチする。
+- `release_unsent` は安全入力の負債予算を払い戻さない。
+- **信頼判定が `Trusted` でも `UncleanShutdown` でもない状態で起動した場合、`RESERVED` を含む非終端の行をすべて `DISPATCHED_ID_UNKNOWN` として扱う。** 外部記録と整合しない台帳では、未送信であることを証明できないため。
+- 外部記録が台帳と同じボリュームにある構成は、`open` で拒否する。
+
+検証:
+
+- ゴースト変数による model-based property test を実物の SQLite 上で実行し、決定的な単体テストと合わせて全件通過。
+- **テストのオラクルが欠陥を検出できることを、意図的な不具合で確認した。** 予約量の半減、ロールオーバでの予約計上漏れ、不正 usage で消費を計上しない、残枠判定のずれ、負債予算の引き落とし漏れの 5 種すべてを property test 単独で検出した。
+
+### 未実装
+
+- 境界の不確かさ窓による受理停止と、信頼できる時刻源（`GET /v1/models`）。admission 層で実装する。台帳は時刻を知らない。
+- `STATUS_UNKNOWN` からの復旧手順（Usage API の 2 回読み取り）。台帳は採用の操作のみを提供する。
+- 予約 capability によるダイジェスト照合と Dispatcher。
+- OpenAI 互換表面、SSE 中継、provider アダプタ、ルータ、受理範囲の allowlist。

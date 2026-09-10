@@ -2,7 +2,7 @@
 
 **無料 LLM 自動切替プロキシ。** OpenAI 互換の endpoint を1つ立て、無料 Quota を使い切るまでは無料枠で捌き、**使い切る前に止める**。
 
-TokenMiser 系のツールが「安く済ませる」ことを目指すのに対し、QuotaMiser が守るのは **Quota そのもの**である。安いモデルへ逃がすのではなく、**無料枠を超えそうなリクエストは送らない**。有料 API は明示的に許可しない限り使わない。
+TokenMiser 系のツールが「安く済ませる」ことを目指すのに対し、QuotaMiser が守るのは **Quota そのもの**である。安いモデルへ逃がすのではなく、**無料枠を超えそうなリクエストは送らない**。v1 には有料 API を使う経路そのものが無い。
 
 ## 中核となる仕組み
 
@@ -10,25 +10,25 @@ TokenMiser 系のツールが「安く済ませる」ことを目指すのに対
 
 ```text
 リクエスト受信
-  → input token + max output token + 安全マージン から最大消費量を保守的に見積もる
+  → input token + max output token から最大消費量（負債）を保守的に見積もる
   → 残 Quota を超える可能性があれば OpenAI へ送らない        (fail-closed)
-  → 送る場合は、送信前に Quota を予約する                    (並列でも超過しない)
+  → 送る場合は、送信前に負債そのものを予約する              (並列でも超過しない)
   → 応答後、実際の使用量と予約量の差分を精算する
 ```
 
 Fallback は無料の範囲でのみ連鎖する:
 
 ```text
-OpenAI 無料 Quota  →  OpenRouter 等の無料 AI  →  Local LLM (Ollama 等)
+OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken Desktop)
 ```
 
 無料で処理できないとき、勝手に有料へ逃げることはしない。
 
 ## 状態
 
-**要件定義フェーズ。実装はまだ無い。**
+**実装フェーズ。** 予約台帳（[`crates/ledger`](crates/ledger)）を実装済み。OpenAI 互換表面・provider アダプタ・ルータは未実装で、プロキシとしてはまだ動作しない。
 
-要件は [`docs/requirements/requirements.md`](docs/requirements/requirements.md) を参照。設計と ADR はこれから。
+要件は [`docs/requirements/requirements.md`](docs/requirements/requirements.md)、設計は [`docs/design/design.md`](docs/design/design.md)、判断の記録は [`docs/adr/`](docs/adr/) を参照。
 
 ## Attribution
 

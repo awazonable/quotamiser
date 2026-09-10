@@ -1,0 +1,15 @@
+[package]
+name = "quotamiser-ledger"
+version = "0.1.0"
+description = "Durable reservation ledger for QuotaMiser admission control. No network access by construction."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"

@@ -1,11 +1,17 @@
 [package]
 name = "quotamiser-protocol"
 version = "0.1.0"
-description = "Wire formats for QuotaMiser: SSE framing and OpenAI error bodies. No I/O."
+description = "Wire formats for QuotaMiser: request allowlist, SSE framing and OpenAI error bodies. No I/O."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-serde_json = "1.0"
+serde = "1.0.229"
+# Field order is kept when a request is normalized: a JSON Schema's property
+# order is the order the model generates the properties in.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 thiserror = "2.0.20"
+
+[dev-dependencies]
+proptest = "1.11.0"

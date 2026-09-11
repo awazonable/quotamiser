@@ -26,7 +26,7 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 
 ## 状態
 
-**実装フェーズ。** 予約台帳（[`crates/ledger`](crates/ledger)）を実装済み。OpenAI 互換表面・provider アダプタ・ルータは未実装で、プロキシとしてはまだ動作しない。
+**実装フェーズ。** 予約台帳（[`crates/ledger`](crates/ledger)）、日付境界と負債の算定（[`crates/admission`](crates/admission)）、受け口の allowlist と正規化（[`crates/protocol`](crates/protocol)）、上流への送信と精算の監督（[`crates/proxy`](crates/proxy)）を実装済み。それらを組み立てる admission、HTTP の受け口、OpenRouter と Local の provider アダプタ、ルータは未実装で、プロキシとしてはまだ動作しない。
 
 要件は [`docs/requirements/requirements.md`](docs/requirements/requirements.md)、設計は [`docs/design/design.md`](docs/design/design.md)、判断の記録は [`docs/adr/`](docs/adr/) を参照。
 

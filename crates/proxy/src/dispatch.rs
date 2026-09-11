@@ -18,6 +18,10 @@
 //!    reading upstream for a bounded time to learn it. A background response
 //!    keeps generating after its connection closes, so without the id there
 //!    would be nothing to cancel and nothing to retrieve.
+//!
+//! Nothing is sent while the provider's rate limit has not reset, or while
+//! it is cooling down after consecutive ambiguous failures; the reservation
+//! is released unsent instead.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::failure_breaker::{BreakerPolicy, FailureBreaker};
 use crate::ledger_handle::LedgerHandle;
 use crate::rate_limit::RateLimitGate;
 use crate::status_policy::{self, ProviderAction, ReservationAction, StatusDecision};
@@ -74,6 +79,7 @@ pub struct DispatchPolicy {
     pub id_wait_after_disconnect: Duration,
     pub max_error_body_bytes: usize,
     pub channel_capacity: usize,
+    pub breaker: BreakerPolicy,
 }
 
 /// What the request handler receives.
@@ -93,6 +99,9 @@ pub enum Head {
     /// Not sent: the provider's rate limit has not reset. The reservation was
     /// released.
     RateLimited { retry_after: Duration },
+    /// Not sent: the provider failed ambiguously several times in a row and
+    /// is cooling down. The reservation was released.
+    CoolingDown { retry_after: Duration },
     /// Nothing was sent; the reservation was released.
     NotSent(String),
     /// Sent, but the outcome is unknown; the reservation is held.
@@ -125,6 +134,7 @@ pub struct Dispatcher {
     upstream: Arc<Upstream>,
     ledger: LedgerHandle,
     gate: Arc<RateLimitGate>,
+    breaker: Arc<FailureBreaker>,
     policy: DispatchPolicy,
 }
 
@@ -134,6 +144,7 @@ impl Dispatcher {
             upstream,
             ledger,
             gate: Arc::new(RateLimitGate::new()),
+            breaker: Arc::new(FailureBreaker::new(policy.breaker)),
             policy,
         }
     }
@@ -144,6 +155,11 @@ impl Dispatcher {
         &self.gate
     }
 
+    /// Admission can consult this too, for the same reason.
+    pub fn failure_breaker(&self) -> &FailureBreaker {
+        &self.breaker
+    }
+
     /// If the caller is dropped while waiting for the head, the supervisor
     /// treats the client as disconnected and carries on.
     pub async fn dispatch(&self, permit: DispatchPermit) -> Dispatched {
@@ -152,6 +168,7 @@ impl Dispatcher {
             self.upstream.clone(),
             self.ledger.clone(),
             self.gate.clone(),
+            self.breaker.clone(),
             self.policy.clone(),
             permit,
             head_tx,
@@ -167,6 +184,7 @@ async fn supervise(
     upstream: Arc<Upstream>,
     ledger: LedgerHandle,
     gate: Arc<RateLimitGate>,
+    breaker: Arc<FailureBreaker>,
     policy: DispatchPolicy,
     permit: DispatchPermit,
     head_tx: oneshot::Sender<Head>,
@@ -178,10 +196,19 @@ async fn supervise(
     } = permit;
     let mut head_tx = Some(head_tx);
 
-    // Sending into a limit that has not reset only earns another 429.
-    if let Some(retry_after) = gate.closed_for(Instant::now()) {
+    // Sending into a limit that has not reset only earns another 429, and
+    // sending into a failing provider only holds another reservation.
+    let held_back = gate
+        .closed_for(Instant::now())
+        .map(|retry_after| Head::RateLimited { retry_after })
+        .or_else(|| {
+            breaker
+                .open_for(Instant::now())
+                .map(|retry_after| Head::CoolingDown { retry_after })
+        });
+    if let Some(head) = held_back {
         let released = ledger.with(move |l| l.release_unsent(reservation)).await;
-        deliver(&mut head_tx, Head::RateLimited { retry_after });
+        deliver(&mut head_tx, head);
         return match released {
             Ok(()) => Disposition::ReleasedUnsent,
             Err(error) => Disposition::LedgerFailed(error.to_string()),
@@ -201,6 +228,7 @@ async fn supervise(
     let response = match upstream.create_response(body).await {
         Ok(response) => response,
         Err(error) => {
+            breaker.record_ambiguous_failure(Instant::now());
             let disposition = hold_as_unknown(&ledger, reservation).await;
             deliver(&mut head_tx, Head::OutcomeUnknown(error.to_string()));
             return disposition;
@@ -220,6 +248,7 @@ async fn supervise(
             relay(
                 &upstream,
                 &ledger,
+                &breaker,
                 &policy,
                 reservation,
                 accounting_rev,
@@ -245,6 +274,7 @@ async fn supervise(
             disposition
         }
         ReservationAction::HoldAsUnknown => {
+            breaker.record_ambiguous_failure(Instant::now());
             let body = read_capped(response, policy.max_error_body_bytes).await;
             let disposition = hold_as_unknown(&ledger, reservation).await;
             deliver(
@@ -260,9 +290,14 @@ async fn supervise(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the supervisor's state, passed down once; a struct would only rename it"
+)]
 async fn relay(
     upstream: &Upstream,
     ledger: &LedgerHandle,
+    breaker: &FailureBreaker,
     policy: &DispatchPolicy,
     reservation: ReservationId,
     accounting_rev: i64,
@@ -313,6 +348,7 @@ async fn relay(
                             response_id = Some(id);
                         }
                         Observation::Terminal(summary) if settled.is_none() => {
+                            breaker.record_completion();
                             let completed = CompletedResponse {
                                 usage: summary.usage.map(|u| quotamiser_ledger::Usage {
                                     input_tokens: u.input_tokens,
@@ -346,6 +382,10 @@ async fn relay(
         }
     }
 
+    // Upstream ended the stream, cleanly or not, before its terminal event.
+    if settled.is_none() {
+        breaker.record_ambiguous_failure(Instant::now());
+    }
     match (settled, response_id) {
         (Some(settlement), _) => Disposition::Settled(settlement),
         (None, Some(response_id)) => Disposition::AwaitingRetrieval { response_id },
@@ -426,15 +466,19 @@ mod tests {
         Redirects,
         RejectsAsBadRequest,
         RateLimits,
+        ServiceUnavailable,
         /// Sends response.created after this delay, then trickles deltas and
         /// never completes.
         CreatedAfter(Duration),
         /// Trickles deltas and never names the response.
         NeverNamesTheResponse,
+        /// Names the response, sends one delta, and ends the stream.
+        EndsBeforeTerminal,
     }
 
     struct Mock {
-        mode: Mode,
+        /// The nth request gets the nth mode; the last repeats.
+        modes: Vec<Mode>,
         requests: AtomicUsize,
         cancels: AtomicUsize,
     }
@@ -452,8 +496,9 @@ mod tests {
     }
 
     async fn responses(State(mock): State<Arc<Mock>>) -> axum::response::Response {
-        mock.requests.fetch_add(1, Ordering::SeqCst);
-        match mock.mode {
+        let nth = mock.requests.fetch_add(1, Ordering::SeqCst);
+        let mode = mock.modes[nth.min(mock.modes.len() - 1)];
+        match mode {
             Mode::Redirects => {
                 return (
                     StatusCode::TEMPORARY_REDIRECT,
@@ -472,10 +517,16 @@ mod tests {
                 )
                     .into_response();
             }
+            Mode::ServiceUnavailable => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":{"message":"overloaded"}}"#,
+                )
+                    .into_response();
+            }
             _ => {}
         }
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(8);
-        let mode = mock.mode;
         tokio::spawn(async move {
             match mode {
                 Mode::Completes => {
@@ -504,7 +555,20 @@ mod tests {
                     trickle(&tx).await;
                 }
                 Mode::NeverNamesTheResponse => trickle(&tx).await,
-                Mode::Redirects | Mode::RejectsAsBadRequest | Mode::RateLimits => unreachable!(),
+                Mode::EndsBeforeTerminal => {
+                    let _ = tx
+                        .send(Ok(lifecycle(
+                            "response.created",
+                            "in_progress",
+                            serde_json::Value::Null,
+                        )))
+                        .await;
+                    let _ = tx.send(Ok(delta())).await;
+                }
+                Mode::Redirects
+                | Mode::RejectsAsBadRequest
+                | Mode::RateLimits
+                | Mode::ServiceUnavailable => unreachable!(),
             }
         });
         (
@@ -529,8 +593,12 @@ mod tests {
     }
 
     async fn mock_upstream(mode: Mode) -> (Arc<Mock>, u16) {
+        scripted_upstream(vec![mode]).await
+    }
+
+    async fn scripted_upstream(modes: Vec<Mode>) -> (Arc<Mock>, u16) {
         let mock = Arc::new(Mock {
-            mode,
+            modes,
             requests: AtomicUsize::new(0),
             cancels: AtomicUsize::new(0),
         });
@@ -600,6 +668,11 @@ mod tests {
             id_wait_after_disconnect: id_wait,
             max_error_body_bytes: 4096,
             channel_capacity: 4,
+            breaker: BreakerPolicy {
+                threshold: 3,
+                initial_cooldown: Duration::from_secs(30),
+                max_cooldown: Duration::from_secs(600),
+            },
         };
         Dispatcher::new(Arc::new(upstream), ledger.clone(), policy)
     }
@@ -862,5 +935,107 @@ mod tests {
             ReservationState::DispatchedIdUnknown
         );
         assert_eq!(counters(&ledger).await, (LIABILITY as i64, 0));
+    }
+
+    async fn drain(head: Head) {
+        if let Head::Stream { mut body, .. } = head {
+            while body.recv().await.is_some() {}
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_server_errors_cool_the_provider_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, first) = reserved_ledger(dir.path());
+        let (mock, port) = mock_upstream(Mode::ServiceUnavailable).await;
+        let dispatcher = dispatcher(port, &ledger, Duration::from_secs(2));
+
+        let mut id = first;
+        for _ in 0..3 {
+            let dispatched = dispatcher.dispatch(permit(id)).await;
+            let Head::Refused { status, .. } = dispatched.head else {
+                panic!("expected a refusal")
+            };
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                dispatched.supervisor.await.unwrap(),
+                Disposition::HeldAsUnknown
+            );
+            id = reserve_another(&ledger).await;
+        }
+
+        let dispatched = dispatcher.dispatch(permit(id)).await;
+        let Head::CoolingDown { retry_after } = dispatched.head else {
+            panic!("expected the provider to be cooling down")
+        };
+        assert!(retry_after > Duration::from_secs(25));
+        assert_eq!(
+            dispatched.supervisor.await.unwrap(),
+            Disposition::ReleasedUnsent
+        );
+        assert_eq!(state(&ledger, id).await, ReservationState::ReleasedUnsent);
+        assert_eq!(
+            mock.requests.load(Ordering::SeqCst),
+            3,
+            "nothing is sent while cooling down"
+        );
+        assert_eq!(
+            counters(&ledger).await,
+            (3 * LIABILITY as i64, 0),
+            "the three unknown outcomes stay held"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_response_between_server_errors_keeps_the_provider_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, first) = reserved_ledger(dir.path());
+        let (mock, port) = scripted_upstream(vec![
+            Mode::ServiceUnavailable,
+            Mode::ServiceUnavailable,
+            Mode::Completes,
+            Mode::ServiceUnavailable,
+            Mode::ServiceUnavailable,
+            Mode::Completes,
+        ])
+        .await;
+        let dispatcher = dispatcher(port, &ledger, Duration::from_secs(2));
+
+        let mut id = first;
+        for _ in 0..6 {
+            let dispatched = dispatcher.dispatch(permit(id)).await;
+            assert!(!matches!(dispatched.head, Head::CoolingDown { .. }));
+            drain(dispatched.head).await;
+            dispatched.supervisor.await.unwrap();
+            id = reserve_another(&ledger).await;
+        }
+        assert_eq!(mock.requests.load(Ordering::SeqCst), 6);
+        assert_eq!(dispatcher.failure_breaker().open_for(Instant::now()), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streams_that_end_before_their_terminal_event_cool_the_provider_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, first) = reserved_ledger(dir.path());
+        let (mock, port) = mock_upstream(Mode::EndsBeforeTerminal).await;
+        let dispatcher = dispatcher(port, &ledger, Duration::from_secs(2));
+
+        let mut id = first;
+        for _ in 0..3 {
+            let dispatched = dispatcher.dispatch(permit(id)).await;
+            drain(dispatched.head).await;
+            assert_eq!(
+                dispatched.supervisor.await.unwrap(),
+                Disposition::AwaitingRetrieval {
+                    response_id: "resp_1".into()
+                },
+                "retrieval settles what the stream could not"
+            );
+            id = reserve_another(&ledger).await;
+        }
+
+        let dispatched = dispatcher.dispatch(permit(id)).await;
+        assert!(matches!(dispatched.head, Head::CoolingDown { .. }));
+        assert_eq!(mock.requests.load(Ordering::SeqCst), 3);
     }
 }

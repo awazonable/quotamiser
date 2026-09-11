@@ -8,7 +8,10 @@
 //! the token count, so the text's tokens never exceed its UTF-8 byte length,
 //! whatever the vocabulary. Request framing (role and boundary tokens) is not
 //! in the text; it is covered by a per-node allowance. Everything else goes to
-//! the provider's exact count instead.
+//! the provider's count instead. That count is exact for most request shapes
+//! but not all: tools declared in an `additional_tools` input item are counted
+//! once less than generation renders them, so the count to use is the sum over
+//! every body `CreateRequest::input_count_bodies` returns (ADR-0008).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
@@ -75,7 +78,8 @@ impl Default for EstimatorPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liability {
     Known(u64),
-    /// Obtain the provider's exact input count, then call [`with_exact_input`].
+    /// Obtain the provider's input count, summed over the count bodies, then
+    /// call [`with_exact_input`].
     NeedsExactInput {
         output_bound: u64,
     },
@@ -142,7 +146,8 @@ pub fn estimate(
     }
 }
 
-/// Completes a liability once the provider has counted the input exactly.
+/// Completes a liability once the provider has counted the input: the sum of
+/// its counts over the count bodies, never a single count of the request.
 pub fn with_exact_input(exact_input_tokens: u64, output_bound: u64) -> Result<u64, EstimateError> {
     exact_input_tokens
         .checked_add(output_bound)

@@ -42,6 +42,17 @@
 - 依存を更新したときに、既定の再送挙動が変わっていないかを確認する必要がある。
 - 3xx の扱いを要件の遷移表に追加した。
 
+## 検証（2026-09-11）
+
+ローカルのモックサーバに対して実測した（reqwest 0.13.5、hyper-util 0.1.20）。
+
+- 既定のクライアントは、HTTP/2 サーバが REFUSED_STREAM を返したとき、1 件の論理的な POST を **3 回**送った。`retry(reqwest::retry::never())` を設定すると 1 回だった。
+- 既定のクライアントは 307 / 308 に追従し、追従先へ同一の JSON 本文を POST した。`redirect(reqwest::redirect::Policy::none())` を設定すると 3xx がそのまま返り、追従先へは 0 件だった。
+- `.send()` の future は、最初に poll されるまで接続もバイト送出も行わない。
+- hyper-util の canceled request retry は 0.13.5 でも有効で、reqwest から無効化する設定は無い。書き込み前に接続の死を検知した場合にだけ別の接続で送り直し、サーバが受け取った要求は 1 件だった。
+- **要求を書き込んだ後で接続の死が判明した場合、サーバは要求全体を受け取っていたのに、クライアントは `IncompleteMessage` エラーを受け取り、再送しなかった。** 送信後のエラーは、上流が要求を受け取った可能性を含む「結果不明」として扱わなければならない。要件の、送信後の connection failure で予約を解放しない扱いと一致する。
+- `pool_max_idle_per_host(0)` で接続の再利用を止めると canceled request retry の経路は生じないが、要求ごとに接続と TLS ハンドシェイクが要る。上記の通りこの再送は重複を生まないため採用しない。
+
 ## References
 
 - [`../requirements/requirements.md`](../requirements/requirements.md) — Fallback の遷移条件

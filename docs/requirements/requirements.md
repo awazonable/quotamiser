@@ -254,6 +254,7 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 | 400 / 422（リクエスト不正） | fallback せずクライアントに返す |
 | 401 / 403 | **設定または安全機構の失敗**として当該 Provider を閉じ、次の Provider へ。記録して警告する |
 | 402（支払い要求） | **当該 Provider を閉じ、次の Provider へ。** OpenRouter を無入金にする設計はこの応答を意図的に生むものであり、クライアントへのエラーとして返してはならない |
+| 3xx（リダイレクト） | **追従しない。** 経路または設定の異常として当該 Provider を閉じ（永続）、次の Provider へ。3xx を返した相手が上流本体である保証は無いため、予約は送信済みとして保持する |
 | 429 | 次の Provider へ |
 | 送信後の timeout / connection failure / 曖昧な 5xx | 予約を未終端のまま保持し、次の Provider へ |
 

@@ -32,7 +32,7 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 
 ## Attribution
 
-実装フェーズで [`openintelligence-labs/tokenmiser`](https://github.com/openintelligence-labs/tokenmiser)（MIT）から OpenAI 互換プロキシ表面・SSE・provider アダプタ・ルータの骨格を移植する予定である。移植した時点で、上流の著作権表示と vendoring 元の commit SHA を `LICENSE` および本節に記録する。
+[`openintelligence-labs/tokenmiser`](https://github.com/openintelligence-labs/tokenmiser)（MIT）から、SSE イベントパーサと、エラー応答の整形・本文サイズ上限・CSRF ガードなどの小さな部品を移植する予定である。サーバ基盤、provider アダプタ、ルータは本製品の制約に合わないため新規に書く（[ADR-0001](docs/adr/0001-selective-port-from-tokenmiser.md) 改訂）。移植した時点で、上流の著作権表示と vendoring 元の commit SHA を `LICENSE` および本節に記録する。
 
 fork ではなく選択的な移植を選んだのは、本製品の中核である予約型 admission control が上流の事後 USD budget と設計上別物であり、上流追従の利益がコストを下回るためである。
 

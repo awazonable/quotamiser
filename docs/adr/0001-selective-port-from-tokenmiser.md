@@ -42,3 +42,16 @@ QuotaMiser は OpenAI 互換の proxy であり、その表面・SSE 中継・pr
 - [`../requirements/requirements.md`](../requirements/requirements.md) — 非目標の節（有料 API のコスト最適化を目的としない）
 - [`../design/design.md`](../design/design.md) — 出発点の節（移植する範囲と新規に書く範囲）
 - `README.md` — Attribution の節
+
+## 改訂（2026-09-11）
+
+**移植範囲を縮小する。fork せず選択移植するという判断は維持する。**
+
+上流（`5fe22e826a0fde09b6910b273dc45bed24316f9f`、v0.6.1）を調査した結果、当初移植対象とした 4 つのうち、本製品の制約にそのまま合うものは無かった。
+
+- **HTTP 表面**: Pingora に結合し、Chat Completions のみを扱う。ハンドラはキャッシュ・予算・cascade・single-flight と絡み合っている。非 streaming 経路はクライアント切断を監視しない。→ 新規に書く（[ADR-0004](0004-axum-http-server.md)）。
+- **SSE 中継**: イベントパーサとそのテストは堅牢で再利用できる。一方、中継部分は切断時に上流へ cancel を送らず、上流の途中切断を正常終了として扱う。→ パーサのみ移植する。
+- **provider アダプタ**: trait を保持する任意のモジュールが credential 付きで送信でき、HTTP クライアントは既定の再送とリダイレクト追従を有効にしたまま使われている。Responses API と cancel に対応しない。→ 新規に書く（[ADR-0005](0005-upstream-client-without-resend.md)）。
+- **ルータ**: プロンプト難易度の分類器であり、fallback と Quota の概念を持たない。→ 新規に書く。
+
+移植するのは、SSE イベントパーサ、エラー応答の整形、本文サイズ上限、CSRF ガード、loopback 既定のバインドといった小さな部品に限る。

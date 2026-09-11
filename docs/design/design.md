@@ -8,12 +8,14 @@
 
 既存コードは無い。`openintelligence-labs/tokenmiser`（Rust、MIT）から**選択移植**する。fork しない。理由は [ADR-0001](../adr/0001-selective-port-from-tokenmiser.md)。
 
+調査の結果、移植できる範囲は当初の想定より狭い（ADR-0001 改訂）。
+
 | 移植する | 新規に書く |
 | --- | --- |
-| OpenAI 互換の HTTP 表面 | admission control 一式 |
-| SSE の中継 | 予約台帳と精算 |
-| provider アダプタの骨格 | 受理範囲の allowlist |
-| ルータの骨格 | 安全入力の検証と安全ラッチ |
+| SSE イベントパーサとそのテスト | HTTP サーバ（axum、[ADR-0004](../adr/0004-axum-http-server.md)） |
+| エラー応答の整形、本文サイズ上限 | OpenAI 互換の受け口 |
+| CSRF ガード、loopback 既定のバインド | provider アダプタと Dispatcher（[ADR-0005](../adr/0005-upstream-client-without-resend.md)） |
+| | ルータ、admission control 一式、予約台帳、受理範囲の allowlist、安全入力と安全ラッチ |
 
 上流の budget 機構は移植しない。**事後記録・USD 建て・プロセス内メモリ**であり、本製品の**送信前・トークン建て・永続**な予約とは設計が別物である。移植時に上流の著作権表示と vendoring 元の commit SHA を `LICENSE` と `README.md` に記録する。
 
@@ -385,6 +387,7 @@ Usage API は**ドリフトの検出にのみ**用いる。`台帳.consumed` が
 - **SQLite の設定失敗。** WAL / 同期モードの設定が失敗したときに起動しないこと。
 - **安全入力の負債予算。** 予算未満の負債を多数通しても総量が予算を超えないこと。
 - **受理範囲の allowlist。** 拒否すべきフィールド・tool・サーバ側文脈参照・リモート URL・構造化 content part の各ケース。
+- **上流クライアントの再送とリダイレクト。** OpenAI・OpenRouter・Local の各 Provider について、モックサーバが 307 / 308 を返したときに追従先へ送られないこと、Provider が永続的に閉じられること、予約が保持されることを確認する（[ADR-0005](../adr/0005-upstream-client-without-resend.md)）。
 - 実 API に対する契約テストは CI から分離し、手動で実行する。`quotamiser-probes.ps1` が原型となる。
 
 ## 安全上の制約

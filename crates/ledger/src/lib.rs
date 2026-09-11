@@ -23,7 +23,8 @@ mod model_tests;
 pub use error::{LedgerError, Result};
 pub use hwm::{ExternalHwm, HighWaterMark};
 pub use ledger::{
-    Admission, Ledger, LedgerConfig, PoolCounters, Refusal, ReservationId, ReservationRequest,
+    Admission, Ledger, LedgerConfig, OpenDispatch, PoolCounters, Refusal, ReservationId,
+    ReservationRequest,
 };
 pub use lock::PoolLock;
 pub use rollover::RolloverOutcome;

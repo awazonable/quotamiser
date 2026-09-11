@@ -65,6 +65,16 @@ pub struct PoolCounters {
     pub reserved: i64,
 }
 
+/// A reservation that was sent and is not yet settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDispatch {
+    pub id: ReservationId,
+    /// `DispatchedWithId` or `DispatchedIdUnknown`.
+    pub state: State,
+    pub response_id: Option<String>,
+    pub created_at: i64,
+}
+
 /// Creates the parent directories of the ledger and the external record, and
 /// refuses to put both on one volume.
 fn prepare_storage_locations(config: &LedgerConfig) -> Result<()> {
@@ -180,6 +190,32 @@ impl Ledger {
     /// The state shared by every row of the reservation's group.
     pub fn reservation_state(&self, id: ReservationId) -> Result<State> {
         load_group(&self.conn, id.0).map(|(_, _, state)| state)
+    }
+
+    /// Every reservation that was sent and is not yet settled, one per group.
+    pub fn open_dispatches(&self) -> Result<Vec<OpenDispatch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT root_id, state, response_id, created_at FROM reservation
+             WHERE id = root_id AND state IN ('DISPATCHED_WITH_ID', 'DISPATCHED_ID_UNKNOWN')
+             ORDER BY root_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let state_text: String = r.get(1)?;
+            let state = State::parse(&state_text).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    format!("unknown reservation state {state_text}").into(),
+                )
+            })?;
+            Ok(OpenDispatch {
+                id: ReservationId(r.get(0)?),
+                state,
+                response_id: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Marks the shutdown clean. A ledger that fails its integrity check is

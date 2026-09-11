@@ -13,7 +13,7 @@
 | 移植する | 新規に書く |
 | --- | --- |
 | SSE イベントパーサとそのテスト | HTTP サーバ（axum、[ADR-0004](../adr/0004-axum-http-server.md)） |
-| エラー応答の整形、本文サイズ上限 | OpenAI 互換の受け口 |
+| エラー応答の整形、本文サイズ上限 | OpenAI 互換の受け口（v1 は Responses API 形。Chat Completions は後から変換アダプタ） |
 | CSRF ガード、loopback 既定のバインド | provider アダプタと Dispatcher（[ADR-0005](../adr/0005-upstream-client-without-resend.md)） |
 | | ルータ、admission control 一式、予約台帳、受理範囲の allowlist、安全入力と安全ラッチ |
 

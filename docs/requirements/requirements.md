@@ -282,6 +282,7 @@ Provider ごとに**対応機能の表**を保持し、ルーティング前に�
 ### インタフェース
 
 - OpenAI 互換 API として既存アプリから透過的に利用できる。
+- **v1 の受け口は Responses API（`POST /v1/responses`）とする。** 想定する利用元は Codex CLI と、OpenClaw をフォークして作るエージェントである。Chat Completions の受け口は、後から変換アダプタとして追加しうる。上流と同じ形の受け口を先に作るのは、精算に関わる SSE の解析に形式の変換を挟まないためである。
 - 上流には **Responses API** を用い、**`background: true`、`store: true` で発行する**。今後の OpenAI API との整合性、および切断後も `GET /v1/responses/{id}` で精算できる経路を確保するため。クライアントへの streaming は background 応答のストリームを中継する形で提供する。
 - 応答には**処理を担当した Provider とモデルをヘッダで返す**。ボディの OpenAI 互換形式は変更しない。退避が起きたことを呼び出し側が観測できないと、品質低下の原因が追えないため。
 

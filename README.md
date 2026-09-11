@@ -32,7 +32,12 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 
 ## Attribution
 
-[`openintelligence-labs/tokenmiser`](https://github.com/openintelligence-labs/tokenmiser)（MIT）から、SSE イベントパーサと、エラー応答の整形・本文サイズ上限・CSRF ガードなどの小さな部品を移植する予定である。サーバ基盤、provider アダプタ、ルータは本製品の制約に合わないため新規に書く（[ADR-0001](docs/adr/0001-selective-port-from-tokenmiser.md) 改訂）。移植した時点で、上流の著作権表示と vendoring 元の commit SHA を `LICENSE` および本節に記録する。
+[`openintelligence-labs/tokenmiser`](https://github.com/openintelligence-labs/tokenmiser)（MIT、Copyright (c) 2026 Open Intelligence Labs contributors）から、commit `5fe22e826a0fde09b6910b273dc45bed24316f9f` 時点の次の部品を移植している。上流の許諾表示は [`LICENSE`](LICENSE) に収録した。
+
+- SSE のイベント境界検出、行終端の扱い、バッファ上限とそのテスト（[`crates/protocol/src/sse.rs`](crates/protocol/src/sse.rs)）
+- OpenAI 形式のエラー応答の整形（[`crates/protocol/src/error_body.rs`](crates/protocol/src/error_body.rs)）
+
+本文サイズ上限や CSRF ガードなどの小さな部品も、必要になった時点で同じく移植し、ここに記録する。サーバ基盤、provider アダプタ、ルータは本製品の制約に合わないため新規に書く（[ADR-0001](docs/adr/0001-selective-port-from-tokenmiser.md) 改訂）。
 
 fork ではなく選択的な移植を選んだのは、本製品の中核である予約型 admission control が上流の事後 USD budget と設計上別物であり、上流追従の利益がコストを下回るためである。
 

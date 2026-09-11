@@ -177,6 +177,11 @@ impl Ledger {
         pool_counters(&self.conn, pool_id, epoch)
     }
 
+    /// The state shared by every row of the reservation's group.
+    pub fn reservation_state(&self, id: ReservationId) -> Result<State> {
+        load_group(&self.conn, id.0).map(|(_, _, state)| state)
+    }
+
     /// Marks the shutdown clean. A ledger that fails its integrity check is
     /// never marked clean.
     pub fn close(self) -> Result<()> {

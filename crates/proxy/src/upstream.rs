@@ -97,13 +97,6 @@ impl Upstream {
     /// Starts generation. Nothing leaves until the returned future is first
     /// polled, and the dispatcher must have made `DISPATCHING` durable before
     /// that poll.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the dispatcher that owns this call is the next piece"
-        )
-    )]
     pub(crate) fn create_response(
         &self,
         canonical_body: Bytes,

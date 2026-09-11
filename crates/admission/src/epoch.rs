@@ -262,11 +262,20 @@ mod tests {
         /// before upstream has reached it plus the opening delay.
         #[test]
         fn never_spends_across_the_reset_and_never_opens_early(
-            true_now in (D - 1) * DAY..(D + 4) * DAY,
+            // Every mistake this guards against lives within seconds or
+            // minutes of a boundary, which uniform sampling over days almost
+            // never reaches. Most cases land right on a boundary.
+            (current, true_now) in ((D - 1)..(D + 4)).prop_flat_map(|current| {
+                let near = prop_oneof![
+                    2 => (0i64..3, -10i64..=10).prop_map(move |(k, s)| end_of(current + k) + s),
+                    3 => (0i64..3, -900i64..=900).prop_map(move |(k, s)| end_of(current + k) + s),
+                    1 => (current - 1) * DAY..(current + 4) * DAY,
+                ];
+                (Just(current), near)
+            }),
             error in -5i64..=5,
             elapsed in 0i64..=600,
             local_offset in -1_000_000i64..1_000_000,
-            current in (D - 1)..(D + 4),
         ) {
             let reading_true = true_now - elapsed;
             let reading = TrustedReading {

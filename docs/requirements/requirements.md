@@ -337,6 +337,7 @@ Provider ごとに**対応機能の表**を保持し、ルーティング前に�
 | `input_tokens` 100 件の課金 | 翌日確認して当日 cost は **$0**。Usage API の completions にも計上されず（計上されていれば input が約 9,400 増えるはずだが 1,922 だった）。**課金されず、無料枠も消費しないと判断する** |
 | 当日の総消費（実測日） | terra で in=1,922 / out=72,644 / 23 リクエスト、cost **$0**。無料枠が実際に適用されていることの確認になる |
 | reasoning token が無料枠を消費するか | out=72,644 のうち 2 万トークン超が reasoning であり、それを含めて cost **$0**。**reasoning token は無料枠で賄われている**。公式文書の合成（reasoning token は output usage に含まれ output token として課金される／無料枠は対象トラフィックの input・output token に適用される）とも一致する |
+| 各イベントが報告する `service_tier` と `model`（2026-09-11、background + stream + store） | `service_tier` を `"default"` で送ると全イベントが `"default"`。**`"auto"` で送るか省略すると、途中のイベントは `"auto"` だが終端イベントは `"default"`**。`model` は要求どおり `gpt-5.6-terra`。精算の検証は予約時の値と終端の値を照合するため、**受け口は `service_tier` を `"default"` に固定して送り、予約にも `"default"` を記録する**。`"auto"` で記録すると最初の精算で不一致となり、予約を全額消費して Pool をラッチする |
 
 `input_tokens` の判定には留保がある。照会したのは Usage API の completions であり、この endpoint が `input_tokens` 経路を含む保証は無い。したがって「usage に現れない」ことは消費ゼロの証明ではない。ただし**課金が発生しなかったことは確定**しており、無料枠を消費するならその消費がどこかに記録されるはずである以上、現時点で得られる最良の証拠として扱う。
 

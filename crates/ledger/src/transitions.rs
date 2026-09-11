@@ -201,6 +201,30 @@ impl Ledger {
         Ok(())
     }
 
+    /// Only for a synchronous refusal of the create request itself, with a
+    /// status proving that processing never started: 400, 401, 402, 403, 404,
+    /// 422 or 429 (ADR-0006). The request did reach upstream, so this is not
+    /// `release_unsent`, but no response exists that could consume anything.
+    /// Safety-input budgets are not refunded.
+    pub fn release_rejected(&mut self, id: ReservationId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (root, rows, state) = load_group(&tx, id.0)?;
+        ensure_allowed(root, state, Transition::RejectBeforeProcessing)?;
+        finish(
+            &tx,
+            root,
+            &rows,
+            state,
+            State::RejectedBeforeProcessing,
+            0,
+            None,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn relabel(
         &mut self,
         id: ReservationId,

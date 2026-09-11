@@ -10,9 +10,11 @@
 //!    first polled; reqwest sends nothing before that poll (ADR-0005).
 //! 2. A transport error after that point is an unknown outcome, because
 //!    upstream may have received the whole request. The reservation is held.
-//! 3. The response id is attached as soon as it is seen, and the reservation
+//! 3. A synchronous refusal whose status proves processing never started
+//!    releases the reservation (ADR-0006); any other refusal holds it.
+//! 4. The response id is attached as soon as it is seen, and the reservation
 //!    is settled from the terminal event's usage.
-//! 4. If the client disconnects before the id is known, the supervisor keeps
+//! 5. If the client disconnects before the id is known, the supervisor keeps
 //!    reading upstream for a bounded time to learn it. A background response
 //!    keeps generating after its connection closes, so without the id there
 //!    would be nothing to cancel and nothing to retrieve.
@@ -30,7 +32,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::ledger_handle::LedgerHandle;
-use crate::status_policy::{self, ReservationAction, StatusDecision};
+use crate::rate_limit::RateLimitGate;
+use crate::status_policy::{self, ProviderAction, ReservationAction, StatusDecision};
 use crate::upstream::Upstream;
 
 /// The right to send exactly one request whose liability has been reserved.
@@ -87,6 +90,9 @@ pub enum Head {
         decision: StatusDecision,
         body: Bytes,
     },
+    /// Not sent: the provider's rate limit has not reset. The reservation was
+    /// released.
+    RateLimited { retry_after: Duration },
     /// Nothing was sent; the reservation was released.
     NotSent(String),
     /// Sent, but the outcome is unknown; the reservation is held.
@@ -104,6 +110,8 @@ pub enum Disposition {
     /// Sent with no id to recover; written off at its deadline.
     HeldAsUnknown,
     ReleasedUnsent,
+    /// Sent and refused before processing started.
+    ReleasedRejected,
     LedgerFailed(String),
 }
 
@@ -116,6 +124,7 @@ pub struct Dispatched {
 pub struct Dispatcher {
     upstream: Arc<Upstream>,
     ledger: LedgerHandle,
+    gate: Arc<RateLimitGate>,
     policy: DispatchPolicy,
 }
 
@@ -124,8 +133,15 @@ impl Dispatcher {
         Self {
             upstream,
             ledger,
+            gate: Arc::new(RateLimitGate::new()),
             policy,
         }
+    }
+
+    /// Admission can consult this before reserving, rather than reserving
+    /// only to have the dispatcher release it.
+    pub fn rate_limit_gate(&self) -> &RateLimitGate {
+        &self.gate
     }
 
     /// If the caller is dropped while waiting for the head, the supervisor
@@ -135,6 +151,7 @@ impl Dispatcher {
         let supervisor = tokio::spawn(supervise(
             self.upstream.clone(),
             self.ledger.clone(),
+            self.gate.clone(),
             self.policy.clone(),
             permit,
             head_tx,
@@ -149,6 +166,7 @@ impl Dispatcher {
 async fn supervise(
     upstream: Arc<Upstream>,
     ledger: LedgerHandle,
+    gate: Arc<RateLimitGate>,
     policy: DispatchPolicy,
     permit: DispatchPermit,
     head_tx: oneshot::Sender<Head>,
@@ -159,6 +177,16 @@ async fn supervise(
         accounting_rev,
     } = permit;
     let mut head_tx = Some(head_tx);
+
+    // Sending into a limit that has not reset only earns another 429.
+    if let Some(retry_after) = gate.closed_for(Instant::now()) {
+        let released = ledger.with(move |l| l.release_unsent(reservation)).await;
+        deliver(&mut head_tx, Head::RateLimited { retry_after });
+        return match released {
+            Ok(()) => Disposition::ReleasedUnsent,
+            Err(error) => Disposition::LedgerFailed(error.to_string()),
+        };
+    }
 
     if let Err(error) = ledger.with(move |l| l.begin_dispatch(reservation)).await {
         let released = ledger.with(move |l| l.release_unsent(reservation)).await;
@@ -181,30 +209,55 @@ async fn supervise(
 
     let status = response.status();
     let decision = status_policy::decide(status.as_u16());
-    if decision.reservation == ReservationAction::HoldAsUnknown {
-        let body = read_capped(response, policy.max_error_body_bytes).await;
-        let disposition = hold_as_unknown(&ledger, reservation).await;
-        deliver(
-            &mut head_tx,
-            Head::Refused {
-                status,
-                decision,
-                body,
-            },
-        );
-        return disposition;
+    if decision.provider == ProviderAction::BackOff {
+        gate.record_rate_limited(response.headers(), Instant::now());
+    } else if status.is_success() {
+        gate.record_headers(response.headers(), Instant::now());
     }
 
-    relay(
-        &upstream,
-        &ledger,
-        &policy,
-        reservation,
-        accounting_rev,
-        response,
-        head_tx,
-    )
-    .await
+    match decision.reservation {
+        ReservationAction::Settle => {
+            relay(
+                &upstream,
+                &ledger,
+                &policy,
+                reservation,
+                accounting_rev,
+                response,
+                head_tx,
+            )
+            .await
+        }
+        ReservationAction::ReleaseRejected => {
+            let body = read_capped(response, policy.max_error_body_bytes).await;
+            let disposition = match ledger.with(move |l| l.release_rejected(reservation)).await {
+                Ok(()) => Disposition::ReleasedRejected,
+                Err(error) => Disposition::LedgerFailed(error.to_string()),
+            };
+            deliver(
+                &mut head_tx,
+                Head::Refused {
+                    status,
+                    decision,
+                    body,
+                },
+            );
+            disposition
+        }
+        ReservationAction::HoldAsUnknown => {
+            let body = read_capped(response, policy.max_error_body_bytes).await;
+            let disposition = hold_as_unknown(&ledger, reservation).await;
+            deliver(
+                &mut head_tx,
+                Head::Refused {
+                    status,
+                    decision,
+                    body,
+                },
+            );
+            disposition
+        }
+    }
 }
 
 async fn relay(
@@ -353,7 +406,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::State;
-    use axum::http::header::LOCATION;
+    use axum::http::header::{LOCATION, RETRY_AFTER};
     use axum::response::IntoResponse;
     use axum::routing::post;
     use quotamiser_ledger::{
@@ -362,7 +415,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::status_policy::{ClientAction, ProviderAction};
+    use crate::status_policy::ClientAction;
     use crate::upstream::UpstreamConfig;
 
     const LIABILITY: u64 = 1_000;
@@ -372,7 +425,9 @@ mod tests {
         Completes,
         Redirects,
         RejectsAsBadRequest,
-        /// Sends response.created after this delay, then trickles deltas and never completes.
+        RateLimits,
+        /// Sends response.created after this delay, then trickles deltas and
+        /// never completes.
         CreatedAfter(Duration),
         /// Trickles deltas and never names the response.
         NeverNamesTheResponse,
@@ -380,6 +435,7 @@ mod tests {
 
     struct Mock {
         mode: Mode,
+        requests: AtomicUsize,
         cancels: AtomicUsize,
     }
 
@@ -396,6 +452,7 @@ mod tests {
     }
 
     async fn responses(State(mock): State<Arc<Mock>>) -> axum::response::Response {
+        mock.requests.fetch_add(1, Ordering::SeqCst);
         match mock.mode {
             Mode::Redirects => {
                 return (
@@ -406,6 +463,14 @@ mod tests {
             }
             Mode::RejectsAsBadRequest => {
                 return (StatusCode::BAD_REQUEST, r#"{"error":{"message":"bad"}}"#).into_response();
+            }
+            Mode::RateLimits => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(RETRY_AFTER, "30")],
+                    r#"{"error":{"message":"slow down"}}"#,
+                )
+                    .into_response();
             }
             _ => {}
         }
@@ -439,7 +504,7 @@ mod tests {
                     trickle(&tx).await;
                 }
                 Mode::NeverNamesTheResponse => trickle(&tx).await,
-                Mode::Redirects | Mode::RejectsAsBadRequest => unreachable!(),
+                Mode::Redirects | Mode::RejectsAsBadRequest | Mode::RateLimits => unreachable!(),
             }
         });
         (
@@ -466,6 +531,7 @@ mod tests {
     async fn mock_upstream(mode: Mode) -> (Arc<Mock>, u16) {
         let mock = Arc::new(Mock {
             mode,
+            requests: AtomicUsize::new(0),
             cancels: AtomicUsize::new(0),
         });
         let router = Router::new()
@@ -476,6 +542,18 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (mock, port)
+    }
+
+    fn request() -> ReservationRequest {
+        ReservationRequest {
+            pool_id: "openai:small".into(),
+            liability: LIABILITY,
+            request_digest: "digest".into(),
+            model_snapshot: "gpt-5.6-terra".into(),
+            service_tier: "default".into(),
+            accounting_rev: 1,
+            required_safety_inputs: vec!["data_sharing".into()],
+        }
     }
 
     fn reserved_ledger(dir: &Path) -> (LedgerHandle, ReservationId) {
@@ -495,20 +573,18 @@ mod tests {
         ledger
             .revalidate_safety_input("data_sharing", 0, i64::MAX / 2, 1_000_000)
             .unwrap();
-        let request = ReservationRequest {
-            pool_id: "openai:small".into(),
-            liability: LIABILITY,
-            request_digest: "digest".into(),
-            model_snapshot: "gpt-5.6-terra".into(),
-            service_tier: "default".into(),
-            accounting_rev: 1,
-            required_safety_inputs: vec!["data_sharing".into()],
-        };
-        let id = match ledger.reserve(&request, 1).unwrap() {
+        let id = match ledger.reserve(&request(), 1).unwrap() {
             Admission::Reserved(id) => id,
             other => panic!("expected a reservation, got {other:?}"),
         };
         (LedgerHandle::new(ledger), id)
+    }
+
+    async fn reserve_another(ledger: &LedgerHandle) -> ReservationId {
+        match ledger.with(|l| l.reserve(&request(), 2)).await.unwrap() {
+            Admission::Reserved(id) => id,
+            other => panic!("expected a reservation, got {other:?}"),
+        }
     }
 
     fn dispatcher(port: u16, ledger: &LedgerHandle, id_wait: Duration) -> Dispatcher {
@@ -610,7 +686,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_bad_request_is_returned_and_the_reservation_held() {
+    async fn a_bad_request_is_returned_and_the_reservation_released() {
         let dir = tempfile::tempdir().unwrap();
         let (ledger, id) = reserved_ledger(dir.path());
         let (_mock, port) = mock_upstream(Mode::RejectsAsBadRequest).await;
@@ -625,8 +701,64 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("bad"));
         assert_eq!(
             dispatched.supervisor.await.unwrap(),
-            Disposition::HeldAsUnknown
+            Disposition::ReleasedRejected
         );
+        assert_eq!(
+            state(&ledger, id).await,
+            ReservationState::RejectedBeforeProcessing
+        );
+        assert_eq!(counters(&ledger).await, (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limit_releases_the_reservation_and_holds_the_provider_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, first) = reserved_ledger(dir.path());
+        let (mock, port) = mock_upstream(Mode::RateLimits).await;
+        let dispatcher = dispatcher(port, &ledger, Duration::from_secs(2));
+
+        let dispatched = dispatcher.dispatch(permit(first)).await;
+        let Head::Refused {
+            status, decision, ..
+        } = dispatched.head
+        else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(decision.provider, ProviderAction::BackOff);
+        assert_eq!(
+            dispatched.supervisor.await.unwrap(),
+            Disposition::ReleasedRejected
+        );
+        assert_eq!(
+            state(&ledger, first).await,
+            ReservationState::RejectedBeforeProcessing
+        );
+        assert_eq!(counters(&ledger).await, (0, 0));
+
+        let second = reserve_another(&ledger).await;
+        let dispatched = dispatcher.dispatch(permit(second)).await;
+        let Head::RateLimited { retry_after } = dispatched.head else {
+            panic!("expected to be held back")
+        };
+        assert!(
+            retry_after > Duration::from_secs(25),
+            "the provider's Retry-After is honoured"
+        );
+        assert_eq!(
+            dispatched.supervisor.await.unwrap(),
+            Disposition::ReleasedUnsent
+        );
+        assert_eq!(
+            state(&ledger, second).await,
+            ReservationState::ReleasedUnsent
+        );
+        assert_eq!(
+            mock.requests.load(Ordering::SeqCst),
+            1,
+            "nothing is sent while the gate is closed"
+        );
+        assert_eq!(counters(&ledger).await, (0, 0));
     }
 
     #[tokio::test(flavor = "multi_thread")]

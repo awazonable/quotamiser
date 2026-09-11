@@ -13,10 +13,13 @@ pub enum State {
     Settled,
     ConsumedUnrecoverable,
     ReleasedUnsent,
+    /// Sent, and refused by upstream with a status proving that processing
+    /// never started (ADR-0006).
+    RejectedBeforeProcessing,
 }
 
 impl State {
-    pub const ALL: [State; 7] = [
+    pub const ALL: [State; 8] = [
         State::Reserved,
         State::Dispatching,
         State::DispatchedWithId,
@@ -24,6 +27,7 @@ impl State {
         State::Settled,
         State::ConsumedUnrecoverable,
         State::ReleasedUnsent,
+        State::RejectedBeforeProcessing,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -35,6 +39,7 @@ impl State {
             State::Settled => "SETTLED",
             State::ConsumedUnrecoverable => "CONSUMED_UNRECOVERABLE",
             State::ReleasedUnsent => "RELEASED_UNSENT",
+            State::RejectedBeforeProcessing => "REJECTED_BEFORE_PROCESSING",
         }
     }
 
@@ -53,8 +58,8 @@ impl State {
         )
     }
 
-    /// May have reached the upstream provider, so its liability can only be
-    /// removed by evidence of what it actually consumed.
+    /// May have reached the upstream provider and has not yet been resolved,
+    /// so its liability can only be removed by evidence of what happened.
     pub fn possibly_sent(self) -> bool {
         matches!(
             self,
@@ -71,6 +76,7 @@ pub enum Transition {
     Settle,
     Unrecoverable,
     ReleaseUnsent,
+    RejectBeforeProcessing,
 }
 
 impl Transition {
@@ -82,6 +88,7 @@ impl Transition {
             Transition::Settle => State::Settled,
             Transition::Unrecoverable => State::ConsumedUnrecoverable,
             Transition::ReleaseUnsent => State::ReleasedUnsent,
+            Transition::RejectBeforeProcessing => State::RejectedBeforeProcessing,
         }
     }
 
@@ -99,6 +106,10 @@ impl Transition {
             // Only a request that provably never reached the HTTP stack may
             // be released without evidence.
             Transition::ReleaseUnsent => from == Reserved,
+            // A synchronous refusal of the create request arrives before any
+            // response id exists. Once an id is known a response exists and
+            // may be consuming, so this is no longer available.
+            Transition::RejectBeforeProcessing => from == Dispatching,
         }
     }
 }
@@ -106,6 +117,16 @@ impl Transition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TRANSITIONS: [Transition; 7] = [
+        Transition::BeginDispatch,
+        Transition::AttachResponseId,
+        Transition::MarkIdUnknown,
+        Transition::Settle,
+        Transition::Unrecoverable,
+        Transition::ReleaseUnsent,
+        Transition::RejectBeforeProcessing,
+    ];
 
     #[test]
     fn names_round_trip() {
@@ -117,22 +138,17 @@ mod tests {
 
     #[test]
     fn terminal_states_allow_nothing() {
-        let transitions = [
-            Transition::BeginDispatch,
-            Transition::AttachResponseId,
-            Transition::MarkIdUnknown,
-            Transition::Settle,
-            Transition::Unrecoverable,
-            Transition::ReleaseUnsent,
-        ];
-        for terminal in [
+        let terminal = [
             State::Settled,
             State::ConsumedUnrecoverable,
             State::ReleasedUnsent,
-        ] {
-            assert!(!terminal.is_active());
-            for t in transitions {
-                assert!(!t.allowed_from(terminal), "{t:?} from {terminal:?}");
+            State::RejectedBeforeProcessing,
+        ];
+        for state in terminal {
+            assert!(!state.is_active());
+            assert!(!state.possibly_sent());
+            for t in TRANSITIONS {
+                assert!(!t.allowed_from(state), "{t:?} from {state:?}");
             }
         }
     }
@@ -141,6 +157,17 @@ mod tests {
     fn a_possibly_sent_request_is_never_released_without_evidence() {
         for state in State::ALL.into_iter().filter(|s| s.possibly_sent()) {
             assert!(!Transition::ReleaseUnsent.allowed_from(state));
+        }
+    }
+
+    #[test]
+    fn a_rejection_before_processing_is_only_recorded_while_dispatching() {
+        for state in State::ALL {
+            assert_eq!(
+                Transition::RejectBeforeProcessing.allowed_from(state),
+                state == State::Dispatching,
+                "{state:?}"
+            );
         }
     }
 

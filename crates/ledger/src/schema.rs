@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS reservation (
     state          TEXT    NOT NULL CHECK (state IN (
                      'RESERVED','DISPATCHING','DISPATCHED_WITH_ID',
                      'DISPATCHED_ID_UNKNOWN','SETTLED',
-                     'CONSUMED_UNRECOVERABLE','RELEASED_UNSENT')),
+                     'CONSUMED_UNRECOVERABLE','RELEASED_UNSENT',
+                     'REJECTED_BEFORE_PROCESSING')),
     liability      INTEGER NOT NULL CHECK (liability >= 0),
     settled        INTEGER CHECK (settled IS NULL OR settled >= 0),
     response_id    TEXT,

@@ -132,6 +132,7 @@ liability が残枠に収まるなら、liability を予約して送信する
 | `RESERVED` | **1 バイトも渡していないことが確実** | `RELEASED_UNSENT` | 群全体 | `reserved -= liability` | 変化なし | 遷移前なら `RESERVED` のまま |
 | `DISPATCHING` | `response.id` を取得 | `DISPATCHED_WITH_ID` | 当該エポック | 変化なし | — | `DISPATCHING` として復帰 |
 | `DISPATCHING` | 送信の成否が不明のまま終了 | `DISPATCHED_ID_UNKNOWN` | 当該エポック | 変化なし | — | 同上 |
+| `DISPATCHING` | 作成リクエストへの同期的な 400・401・402・403・404・422・429（[ADR-0006](../adr/0006-release-on-synchronous-refusal.md)） | `REJECTED_BEFORE_PROCESSING` | 群全体 | `reserved -= liability` | 変化なし | 未コミットなら `DISPATCHING` として復帰（保守側） |
 | `DISPATCHED_*` | 検証を通った usage | `SETTLED` | **群全体** | `reserved -= liability`, `consumed += actual` | — | 未コミットなら再実行 |
 | `DISPATCHED_*` / `DISPATCHING` | 回収不能の確定 | `CONSUMED_UNRECOVERABLE` | **群全体** | `reserved -= liability`, `consumed += liability` | — | 同上 |
 
@@ -427,9 +428,18 @@ Usage API は**ドリフトの検出にのみ**用いる。`台帳.consumed` が
 - ゴースト変数による model-based property test を実物の SQLite 上で実行し、決定的な単体テストと合わせて全件通過。
 - **テストのオラクルが欠陥を検出できることを、意図的な不具合で確認した。** 予約量の半減、ロールオーバでの予約計上漏れ、不正 usage で消費を計上しない、残枠判定のずれ、負債予算の引き落とし漏れの 5 種すべてを property test 単独で検出した。
 
+### proxy 層 — 一部実装済み
+
+- **`crates/admission`（I/O なし）:** 日付境界の判定と負債の見積り器。性質テストの検出力を、意図的に不具合を入れた複製で確認した。
+- **`crates/protocol`（I/O なし）:** SSE のイベント境界検出とエラー応答の整形（tokenmiser から移植）、Responses イベント列の観測器。
+- **`crates/proxy`:** 上流ステータスの判定、上流 HTTP クライアント（再送・リダイレクト追従・システムプロキシを無効化）、Dispatcher と監督タスク、回収ワーカー、信頼できる時刻源、レート制限ゲート。
+
 ### 未実装
 
-- 境界の不確かさ窓による受理停止と、信頼できる時刻源（`GET /v1/models`）。admission 層で実装する。台帳は時刻を知らない。
-- `STATUS_UNKNOWN` からの復旧手順（Usage API の 2 回読み取り）。台帳は採用の操作のみを提供する。
-- 予約 capability によるダイジェスト照合と Dispatcher。
-- OpenAI 互換表面、SSE 中継、provider アダプタ、ルータ、受理範囲の allowlist。
+- 受理範囲の allowlist と正規化。Codex と OpenClaw の実際のリクエスト形との衝突の整理を待つ。
+- admission の組み立て（正規化済みリクエスト → 負債算定 → `input_tokens` による確定 → 予約 → 予約 capability）。
+- 日付境界の判定と時刻源によるロールオーバの実行ループ、`STATUS_UNKNOWN` からの復旧手順。
+- OpenRouter と Local の provider アダプタ、ルータ、Provider ごとのリダイレクトのテスト。
+- axum による受け口と、Dispatcher の結果をクライアントへの応答に変換する処理（WebSocket 要求への 426 を含む）。
+- HTTP/2 の REFUSED_STREAM で再送しないことを固定するテスト、`tool_usage` による hosted tool 利用の検出。
+- 設定の読み込みと実行バイナリ。

@@ -320,6 +320,7 @@ enum Cmd {
     SettleInvalid(usize),
     WriteOff(usize),
     ReleaseUnsent(usize),
+    RejectBeforeProcessing(usize),
     Rollover,
     Revalidate,
     CrashAfterExternalWrite(usize),
@@ -339,6 +340,7 @@ fn cmd() -> impl Strategy<Value = Cmd> {
         1 => any::<usize>().prop_map(Cmd::SettleInvalid),
         1 => any::<usize>().prop_map(Cmd::WriteOff),
         1 => any::<usize>().prop_map(Cmd::ReleaseUnsent),
+        1 => any::<usize>().prop_map(Cmd::RejectBeforeProcessing),
         1 => Just(Cmd::Rollover),
         1 => Just(Cmd::Revalidate),
         1 => any::<usize>().prop_map(Cmd::CrashAfterExternalWrite),
@@ -594,6 +596,15 @@ fn run(cmds: Vec<Cmd>) {
                     let legal = model.requests[i].state == State::Reserved;
                     if expect_legal(ledger.release_unsent(model.requests[i].id), legal).is_some() {
                         model.requests[i].state = State::ReleasedUnsent;
+                    }
+                }
+            }
+            Cmd::RejectBeforeProcessing(n) => {
+                if let Some(i) = model.pick(n) {
+                    let legal = model.requests[i].state == State::Dispatching;
+                    if expect_legal(ledger.release_rejected(model.requests[i].id), legal).is_some()
+                    {
+                        model.requests[i].state = State::RejectedBeforeProcessing;
                     }
                 }
             }

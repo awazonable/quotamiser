@@ -1,5 +1,6 @@
 //! The QuotaMiser proxy.
 
+pub mod clock;
 pub mod dispatch;
 pub mod ledger_handle;
 pub mod retrieval;

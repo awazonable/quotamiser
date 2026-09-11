@@ -136,6 +136,15 @@ impl Upstream {
             .await
             .map_err(UpstreamError::Transport)
     }
+
+    /// Lists models. Consumes no quota, and answers whether or not inference
+    /// is open, which makes its `Date` header a usable time source.
+    pub async fn list_models(&self) -> Result<Response, UpstreamError> {
+        self.request(reqwest::Method::GET, "/models")
+            .send()
+            .await
+            .map_err(UpstreamError::Transport)
+    }
 }
 
 /// Response ids come from upstream output, but they still become a URL path

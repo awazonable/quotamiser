@@ -68,6 +68,27 @@ CREATE TABLE IF NOT EXISTS safety_input (
     budget_remaining INTEGER NOT NULL CHECK (budget_remaining >= 0)
 ) STRICT;
 
+-- A provider whose free allowance is counted in requests, not tokens. Its
+-- resource model is deliberately not the reservation ledger's: a request that
+-- fails still spends the allowance, so a slot taken here is never given back.
+CREATE TABLE IF NOT EXISTS request_counter (
+    provider      TEXT    NOT NULL,
+    epoch         INTEGER NOT NULL,
+    limit_per_day INTEGER NOT NULL CHECK (limit_per_day >= 0),
+    used          INTEGER NOT NULL CHECK (used >= 0),
+    PRIMARY KEY (provider, epoch)
+) STRICT;
+
+-- When each request left, so a short rate-limit window survives a restart.
+CREATE TABLE IF NOT EXISTS request_dispatch (
+    id       INTEGER PRIMARY KEY,
+    provider TEXT    NOT NULL,
+    at       INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS request_dispatch_by_provider
+    ON request_dispatch (provider, at);
+
 CREATE TABLE IF NOT EXISTS latch (
     id         INTEGER PRIMARY KEY,
     scope      TEXT    NOT NULL,          -- 'global' or a pool_id

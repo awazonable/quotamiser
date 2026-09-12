@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use quotamiser_admission::epoch::{ClockPolicy, PolicyError};
 use quotamiser_admission::liability::ModelSpec;
-use quotamiser_ledger::LedgerConfig;
+use quotamiser_ledger::{LedgerConfig, RequestWindow};
 use serde::Deserialize;
 
 use crate::upstream::UpstreamConfig;
@@ -48,6 +48,14 @@ pub enum ConfigError {
     DuplicatePool(String),
     #[error("model {0} is configured twice")]
     DuplicateModel(String),
+    #[error(
+        "pool {0} is reserved for the request counter, which counts requests rather than tokens"
+    )]
+    PoolNameReserved(String),
+    #[error("the OpenRouter route is enabled but lists no models, so it could never serve one")]
+    NoOpenRouterModels,
+    #[error("the OpenRouter rate-limit window must allow at least one request in a positive time")]
+    EmptyOpenRouterWindow,
     #[error("the clock policy is not acceptable: {0}")]
     Clock(#[from] PolicyError),
 }
@@ -62,6 +70,9 @@ pub struct Config {
     pub clock: Clock,
     #[serde(default)]
     pub safety: Safety,
+    /// The second free route. Absent means OpenAI only.
+    #[serde(default)]
+    pub openrouter: Option<OpenRouterSection>,
     #[serde(rename = "pool")]
     pub pools: Vec<Pool>,
     #[serde(rename = "model")]
@@ -175,6 +186,70 @@ pub struct Model {
     pub byte_level_encoding_known: bool,
 }
 
+/// OpenRouter's free allowance is a number of requests a day, not tokens, so
+/// this section is denominated in requests throughout.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterSection {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "openrouter_base_url")]
+    pub base_url: String,
+    pub api_key_env: String,
+    /// Only a management key can list BYOK endpoints. Without one, BYOK is
+    /// recorded as unchecked rather than assumed absent.
+    #[serde(default)]
+    pub management_key_env: Option<String>,
+    /// 50 a day on an account that has never bought credits, 1,000 after $10.
+    #[serde(default = "fifty")]
+    pub daily_request_limit: u64,
+    /// OpenRouter answers successful requests with no rate-limit headers, so
+    /// the short window is enforced here before sending, not after a 429.
+    #[serde(default = "twenty")]
+    pub max_requests_per_window: u32,
+    #[serde(default = "sixty")]
+    pub window_seconds: i64,
+    #[serde(default = "nine_hundred_u64")]
+    pub account_ttl_seconds: u64,
+    /// Ordered. The first whose capabilities cover a request is used, so the
+    /// catch-all router belongs last.
+    #[serde(rename = "model", default)]
+    pub models: Vec<OpenRouterModelSection>,
+}
+
+/// What a `:free` model was **measured** to accept. Not what it advertises:
+/// the providers behind one model id differ, and `supported_parameters` does
+/// not describe Codex's custom or namespace tool shapes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterModelSection {
+    pub id: String,
+    #[serde(default = "yes")]
+    pub function_tools: bool,
+    #[serde(default)]
+    pub custom_tools: bool,
+    #[serde(default)]
+    pub namespace_tools: bool,
+    #[serde(default)]
+    pub structured_outputs: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+fn openrouter_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+fn fifty() -> u64 {
+    50
+}
+fn twenty() -> u32 {
+    20
+}
+fn sixty() -> i64 {
+    60
+}
+
 fn four() -> u64 {
     4
 }
@@ -197,6 +272,10 @@ fn nine_hundred_u64() -> u64 {
     900
 }
 
+/// The request counter's key for the OpenRouter route. It is not a token
+/// pool, and nothing denominated in tokens may use this name.
+pub const OPENROUTER_POOL: &str = "openrouter:free";
+
 /// One model's place in the inventory.
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
@@ -218,6 +297,34 @@ pub struct Resolved {
     /// Pool grants for a day, in the order the ledger is given them.
     pub grants: Vec<(String, u64)>,
     pub catalog: HashMap<String, CatalogEntry>,
+    /// `None` when the route is absent or switched off.
+    pub openrouter: Option<ResolvedOpenRouter>,
+}
+
+/// One `:free` model and what it was measured to accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterModel {
+    pub id: String,
+    pub function_tools: bool,
+    pub custom_tools: bool,
+    pub namespace_tools: bool,
+    pub structured_outputs: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedOpenRouter {
+    pub base_url: String,
+    pub api_key: String,
+    pub management_key: Option<String>,
+    /// The request counter's key. Not a token pool; the two are different
+    /// resources and never share a counter.
+    pub pool_id: String,
+    pub daily_request_limit: u64,
+    pub window: RequestWindow,
+    pub account_ttl: i64,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub models: Vec<OpenRouterModel>,
 }
 
 impl Config {
@@ -255,6 +362,11 @@ impl Config {
             if grants.iter().any(|(id, _)| *id == pool.id) {
                 return Err(ConfigError::DuplicatePool(pool.id.clone()));
             }
+            // Token pools and the request counter must never share a name: one
+            // is denominated in tokens and the other in requests.
+            if pool.id == OPENROUTER_POOL {
+                return Err(ConfigError::PoolNameReserved(pool.id.clone()));
+            }
             grants.push((pool.id.clone(), pool.granted_per_day));
         }
 
@@ -280,6 +392,48 @@ impl Config {
                 return Err(ConfigError::DuplicateModel(model.id.clone()));
             }
         }
+
+        let openrouter = match &self.openrouter {
+            Some(section) if section.enabled => {
+                if section.models.is_empty() {
+                    return Err(ConfigError::NoOpenRouterModels);
+                }
+                if section.max_requests_per_window == 0 || section.window_seconds <= 0 {
+                    return Err(ConfigError::EmptyOpenRouterWindow);
+                }
+                let api_key = credential(&section.api_key_env)?;
+                let management_key = match &section.management_key_env {
+                    Some(name) => Some(credential(name)?),
+                    None => None,
+                };
+                Some(ResolvedOpenRouter {
+                    base_url: section.base_url.clone(),
+                    api_key,
+                    management_key,
+                    pool_id: OPENROUTER_POOL.to_string(),
+                    daily_request_limit: section.daily_request_limit,
+                    window: RequestWindow {
+                        max_in_window: section.max_requests_per_window,
+                        window_seconds: section.window_seconds,
+                    },
+                    account_ttl: i64::try_from(section.account_ttl_seconds).unwrap_or(i64::MAX),
+                    connect_timeout: Duration::from_secs(self.upstream.connect_timeout_seconds),
+                    read_timeout: Duration::from_secs(self.upstream.read_timeout_seconds),
+                    models: section
+                        .models
+                        .iter()
+                        .map(|model| OpenRouterModel {
+                            id: model.id.clone(),
+                            function_tools: model.function_tools,
+                            custom_tools: model.custom_tools,
+                            namespace_tools: model.namespace_tools,
+                            structured_outputs: model.structured_outputs,
+                        })
+                        .collect(),
+                })
+            }
+            _ => None,
+        };
 
         let clock_policy = ClockPolicy::new(
             self.clock.reading_uncertainty_seconds,
@@ -317,6 +471,7 @@ impl Config {
             safety_budget_divisor: self.safety.liability_budget_divisor.max(1),
             grants,
             catalog,
+            openrouter,
         })
     }
 }
@@ -378,6 +533,7 @@ max_output_tokens = 128000
         unsafe {
             std::env::set_var("QM_TEST_KEY", "sk-test");
             std::env::set_var("QM_TEST_ADMIN", "sk-admin-test");
+            std::env::set_var("QM_TEST_OR", "sk-or-test");
         }
         body()
     }
@@ -433,6 +589,73 @@ max_output_tokens = 128000
             matches!(&error, ConfigError::MissingCredential(name) if name == "QM_TEST_ABSENT"),
             "{error}"
         );
+    }
+
+    const OPENROUTER: &str = r#"
+[openrouter]
+api_key_env = "QM_TEST_OR"
+daily_request_limit = 50
+max_requests_per_window = 20
+window_seconds = 60
+
+[[openrouter.model]]
+id = "nex-agi/nex-n2.5-pro:free"
+namespace_tools = true
+
+[[openrouter.model]]
+id = "openrouter/free"
+namespace_tools = true
+"#;
+
+    #[test]
+    fn the_openrouter_route_resolves_with_its_measured_capabilities() {
+        let resolved =
+            with_credentials(|| parse(&format!("{SAMPLE}{OPENROUTER}")).resolve().unwrap());
+        let route = resolved.openrouter.expect("the route is configured");
+        assert_eq!(route.pool_id, OPENROUTER_POOL);
+        assert_eq!(route.daily_request_limit, 50);
+        assert_eq!(route.window.max_in_window, 20);
+        assert_eq!(route.window.window_seconds, 60);
+        assert_eq!(route.management_key, None, "BYOK is simply not checked");
+        assert_eq!(route.models.len(), 2);
+        assert_eq!(route.models[0].id, "nex-agi/nex-n2.5-pro:free");
+        assert!(route.models[0].function_tools);
+        assert!(
+            !route.models[0].custom_tools,
+            "custom tools default to unavailable until measured"
+        );
+        assert!(route.models[0].namespace_tools);
+        assert_eq!(
+            route.models[1].id, "openrouter/free",
+            "the catch-all router comes last"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_disabled_openrouter_route_resolves_to_none() {
+        let resolved = with_credentials(|| parse(SAMPLE).resolve().unwrap());
+        assert!(resolved.openrouter.is_none());
+
+        let off = format!(
+            "{SAMPLE}{}",
+            OPENROUTER.replace("[openrouter]", "[openrouter]\nenabled = false")
+        );
+        let resolved = with_credentials(|| parse(&off).resolve().unwrap());
+        assert!(resolved.openrouter.is_none());
+    }
+
+    #[test]
+    fn an_enabled_route_with_no_models_is_refused() {
+        let text = format!("{SAMPLE}\n[openrouter]\napi_key_env = \"QM_TEST_OR\"\n");
+        let error = with_credentials(|| refuse(parse(&text)));
+        assert!(matches!(error, ConfigError::NoOpenRouterModels), "{error}");
+    }
+
+    #[test]
+    fn a_token_pool_may_not_take_the_request_counters_name() {
+        let text = SAMPLE.replace("id = \"openai:small\"", "id = \"openrouter:free\"");
+        let error = with_credentials(|| refuse(parse(&text)));
+        assert!(matches!(error, ConfigError::PoolNameReserved(_)), "{error}");
     }
 
     #[test]

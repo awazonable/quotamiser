@@ -25,6 +25,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{Decision, Refused};
 use crate::dispatch::Head;
+use crate::openrouter::model_for;
+use crate::openrouter_dispatch::Sent;
 use crate::runtime::Runtime;
 
 /// Codex sends its whole conversation every turn, so the cap is generous;
@@ -96,7 +98,16 @@ async fn create_response(
     let model = request.model().to_owned();
     let permit = match runtime.admitter().admit(&request, now, window).await {
         Decision::Admitted(permit) => permit,
-        Decision::Refused(refused) => return refusal_response(refused, now),
+        Decision::Refused(refused) => {
+            // Only a shortage moves on. A request the allowlist or the
+            // catalogue rejects would be just as wrong at the next provider.
+            if is_capacity_shortage(&refused)
+                && let Some(response) = try_openrouter(&runtime, &request, now).await
+            {
+                return response;
+            }
+            return refusal_response(refused, now);
+        }
     };
 
     let dispatched = runtime.dispatcher().dispatch(permit).await;
@@ -126,6 +137,11 @@ async fn create_response(
             response
         }
         Head::RateLimited { retry_after } | Head::CoolingDown { retry_after } => {
+            // Nothing was sent and no quota was spent, so the second route may
+            // still serve this.
+            if let Some(response) = try_openrouter(&runtime, &request, now).await {
+                return response;
+            }
             let seconds = retry_after.as_secs().max(1);
             let mut response = unavailable_until(
                 "The provider is not accepting requests right now. Nothing was sent, and no quota was spent.",
@@ -139,6 +155,75 @@ async fn create_response(
         Head::NotSent(reason) | Head::OutcomeUnknown(reason) => {
             error_detail(StatusCode::SERVICE_UNAVAILABLE, &reason)
         }
+    }
+}
+
+/// Whether OpenAI refused for want of capacity, rather than because of
+/// something about the request itself.
+fn is_capacity_shortage(refused: &Refused) -> bool {
+    match refused {
+        Refused::Ledger(
+            Refusal::InsufficientQuota { .. }
+            | Refusal::PoolNotOpen { .. }
+            | Refusal::Latched { .. }
+            | Refusal::SafetyInputMissing(_)
+            | Refusal::SafetyInputExpired(_)
+            | Refusal::SafetyBudgetExhausted { .. },
+        )
+        | Refused::WindowClosed(_) => true,
+        Refused::UnknownModel(_)
+        | Refused::RolloverDue { .. }
+        | Refused::Ledger(Refusal::Untrusted(_))
+        | Refused::InputNotCounted(_)
+        | Refused::Estimate(_)
+        | Refused::LedgerUnavailable(_) => false,
+    }
+}
+
+/// Tries the second route, if it is configured, open, and known to accept
+/// this request's shape. `None` means it could not serve it and the caller's
+/// own refusal stands.
+async fn try_openrouter(runtime: &Runtime, request: &CreateRequest, now: i64) -> Option<Response> {
+    let route = runtime.openrouter()?;
+    if !route.is_open() {
+        return None;
+    }
+    // Measured, not advertised: a shape no configured model takes is not sent,
+    // because being refused would itself spend one of the day's requests.
+    let model = model_for(
+        &route.models,
+        request.tool_usage(),
+        request.needs_structured_output(),
+    )?;
+
+    let body = Bytes::from(request.openrouter_body(&model.id));
+    match route.dispatcher.send(body, epoch_of(now), now).await {
+        Sent::Stream {
+            status,
+            content_type,
+            body,
+        } => {
+            let stream = ReceiverStream::new(body).map(Ok::<Bytes, Infallible>);
+            let mut response = Response::builder()
+                .status(status)
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                content_type.unwrap_or_else(|| HeaderValue::from_static("text/event-stream")),
+            );
+            attribute_to(headers, "openrouter", &model.id);
+            Some(response)
+        }
+        Sent::Refused { status, body } => {
+            let mut response = (status, body).into_response();
+            attribute_to(response.headers_mut(), "openrouter", &model.id);
+            Some(response)
+        }
+        // Nothing this route can do now; the caller's refusal is the answer.
+        Sent::Exhausted { .. } | Sent::HeldBack { .. } => None,
+        Sent::Failed(_) => None,
     }
 }
 
@@ -198,7 +283,13 @@ fn refusal_response(refused: Refused, now: i64) -> Response {
 }
 
 fn attribute(headers: &mut HeaderMap, model: &str) {
-    headers.insert(PROVIDER_HEADER, HeaderValue::from_static("openai"));
+    attribute_to(headers, "openai", model);
+}
+
+/// The client is told which provider and model actually served it, so a drop
+/// in quality has somewhere to be traced to.
+fn attribute_to(headers: &mut HeaderMap, provider: &'static str, model: &str) {
+    headers.insert(PROVIDER_HEADER, HeaderValue::from_static(provider));
     if let Ok(value) = HeaderValue::from_str(model) {
         headers.insert(MODEL_HEADER, value);
     }

@@ -17,4 +17,6 @@ Thumbs.db
 
 # local configuration and ledger state
 /quotamiser.toml
+/quotamiser.*.toml
 /state/
+/state-*/

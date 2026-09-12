@@ -11,6 +11,7 @@ mod error;
 mod hwm;
 mod ledger;
 mod lock;
+mod requests;
 mod rollover;
 mod schema;
 mod state;
@@ -27,6 +28,7 @@ pub use ledger::{
     ReservationRequest,
 };
 pub use lock::PoolLock;
+pub use requests::{RequestSlot, RequestWindow};
 pub use rollover::RolloverOutcome;
 pub use state::{State, Transition};
 pub use transitions::{CompletedResponse, Settlement, Usage, UsageDefect};

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use quotamiser_admission::epoch::{ClockPolicy, Window, epoch_of, window};
@@ -23,10 +24,13 @@ use tokio::task::JoinHandle;
 
 use crate::admission::{AdmissionPolicy, Admitter};
 use crate::clock::{ClockError, TrustedClock};
+use crate::config::OpenRouterModel;
 use crate::config::{CatalogEntry, Resolved};
 use crate::dispatch::{DispatchPolicy, Dispatcher};
 use crate::failure_breaker::BreakerPolicy;
 use crate::ledger_handle::{LedgerAccessError, LedgerHandle};
+use crate::openrouter::{OpenRouter, OpenRouterError};
+use crate::openrouter_dispatch::{OpenRouterDispatcher, OpenRouterPolicy};
 use crate::retrieval::{RetrievalPolicy, RetrievalWorker};
 use crate::upstream::{Upstream, UpstreamError};
 use crate::usage_api::{UsageApi, UsageApiError};
@@ -53,6 +57,23 @@ pub enum StartupError {
     NoTrustedTime(#[from] ClockError),
     #[error("the ledger could not be recovered from usage reporting: {0}")]
     Recovery(String),
+    #[error("the OpenRouter client could not be built: {0}")]
+    OpenRouter(#[from] OpenRouterError),
+}
+
+/// The second route. It exists only while the account makes paid use
+/// impossible; the check that decides that runs again on a timer, and closes
+/// the route the moment it stops holding.
+pub struct OpenRouterRoute {
+    pub dispatcher: OpenRouterDispatcher,
+    pub models: Vec<OpenRouterModel>,
+    open: Arc<AtomicBool>,
+}
+
+impl OpenRouterRoute {
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Relaxed)
+    }
 }
 
 pub struct Runtime {
@@ -66,6 +87,7 @@ pub struct Runtime {
     catalog: HashMap<String, CatalogEntry>,
     data_sharing_ttl: i64,
     safety_budget: u64,
+    openrouter: Option<OpenRouterRoute>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -119,6 +141,56 @@ impl Runtime {
             log("data sharing is not verified; admission will refuse until it is.");
         }
 
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let openrouter = match resolved.openrouter {
+            Some(route) => {
+                let client = Arc::new(OpenRouter::new(&route)?);
+                let open = Arc::new(AtomicBool::new(false));
+                match client.verify_account().await {
+                    Ok(check) if check.safe() => {
+                        open.store(true, Ordering::Relaxed);
+                        log(&format!(
+                            "OpenRouter route open: free tier, {} credits, BYOK {}, {} requests a day",
+                            check.total_credits,
+                            match check.byok_endpoints {
+                                Some(count) => count.to_string(),
+                                None => "unchecked".to_string(),
+                            },
+                            route.daily_request_limit
+                        ));
+                    }
+                    Ok(check) => log(&format!(
+                        "OpenRouter route closed: {}",
+                        check.why_unsafe().unwrap_or_default()
+                    )),
+                    Err(error) => log(&format!(
+                        "OpenRouter could not be verified ({error}); the route stays closed"
+                    )),
+                }
+                tasks.push(tokio::spawn(verify_openrouter_account(
+                    client.clone(),
+                    open.clone(),
+                    route.account_ttl,
+                )));
+                Some(OpenRouterRoute {
+                    dispatcher: OpenRouterDispatcher::new(
+                        client,
+                        ledger.clone(),
+                        OpenRouterPolicy {
+                            pool_id: route.pool_id.clone(),
+                            daily_request_limit: route.daily_request_limit,
+                            window: route.window,
+                            max_error_body_bytes: 64 * 1024,
+                            channel_capacity: 32,
+                        },
+                    ),
+                    models: route.models.clone(),
+                    open,
+                })
+            }
+            None => None,
+        };
+
         let admitter = Admitter::new(
             upstream.clone(),
             ledger.clone(),
@@ -151,7 +223,8 @@ impl Runtime {
             catalog: resolved.catalog,
             data_sharing_ttl: resolved.data_sharing_ttl,
             safety_budget,
-            tasks: Vec::new(),
+            openrouter,
+            tasks,
         };
         runtime.spawn_loops(upstream, resolved.clock_refresh);
         Ok(runtime)
@@ -256,6 +329,12 @@ impl Runtime {
 
     pub fn ledger(&self) -> &LedgerHandle {
         &self.ledger
+    }
+
+    /// The second route, when it is configured. Whether it may be used right
+    /// now is [`OpenRouterRoute::is_open`].
+    pub fn openrouter(&self) -> Option<&OpenRouterRoute> {
+        self.openrouter.as_ref()
     }
 
     /// Trusted time now: the last reading advanced by monotonic elapsed time.
@@ -404,6 +483,34 @@ pub async fn refresh_data_sharing(
     }
 }
 
+/// Re-checks the OpenRouter account before its verification goes stale. A
+/// check that fails, for any reason, closes the route: the barrier this
+/// watches is the whole reason paid use cannot happen there.
+async fn verify_openrouter_account(client: Arc<OpenRouter>, open: Arc<AtomicBool>, ttl: i64) {
+    let every = Duration::from_secs(u64::try_from((ttl / 3).clamp(60, 3_600)).unwrap_or(300));
+    loop {
+        tokio::time::sleep(every).await;
+        match client.verify_account().await {
+            Ok(check) if check.safe() => open.store(true, Ordering::Relaxed),
+            Ok(check) => {
+                if open.swap(false, Ordering::Relaxed) {
+                    log(&format!(
+                        "OpenRouter route closed: {}",
+                        check.why_unsafe().unwrap_or_default()
+                    ));
+                }
+            }
+            Err(error) => {
+                if open.swap(false, Ordering::Relaxed) {
+                    log(&format!(
+                        "OpenRouter route closed: the account could not be verified ({error})"
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn log(message: &str) {
     println!("[quotamiser] {message}");
 }
@@ -499,6 +606,7 @@ mod tests {
             data_sharing_ttl: 900,
             safety_budget_divisor: 4,
             grants: vec![(POOL.to_string(), 2_500_000)],
+            openrouter: None,
             catalog: HashMap::from([(
                 MODEL.to_string(),
                 CatalogEntry {

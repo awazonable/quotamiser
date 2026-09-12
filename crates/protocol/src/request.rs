@@ -108,6 +108,20 @@ pub struct FlatText<'a> {
     pub input: &'a str,
 }
 
+/// Which tool shapes a request carries, wherever they are declared: at the top
+/// level, inside a namespace, or in an `additional_tools` input item.
+///
+/// A provider is chosen against this before anything is sent. Sending a shape
+/// the provider refuses wastes a request on a provider whose allowance is
+/// counted in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolUsage {
+    pub function: bool,
+    pub custom: bool,
+    pub namespace: bool,
+    pub additional_tools: bool,
+}
+
 /// Fields `POST /v1/responses/input_tokens` takes that can change the count.
 /// `text` is among them: a JSON Schema output format is part of the input.
 const COUNTED_FIELDS: [&str; 8] = [
@@ -299,6 +313,87 @@ impl CreateRequest {
         serde_json::to_vec(&Value::Object(body)).expect("a JSON value always serializes")
     }
 
+    /// The canonical body for OpenRouter, whose free allowance is counted in
+    /// requests rather than tokens.
+    ///
+    /// Measured on 2026-09-12: OpenRouter's Responses endpoint refuses
+    /// `store: true` outright ("expected false"), so the retrieval-based
+    /// settlement OpenAI needs has nothing to work with here — and needs
+    /// nothing, since no token is being reserved. Fields whose behaviour was
+    /// not measured there are left out rather than guessed at: the request is
+    /// reduced to what a measurement showed the endpoint accepts.
+    pub fn openrouter_body(&self, model: &str) -> Vec<u8> {
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String(model.to_owned()));
+        for name in [
+            "instructions",
+            "input",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+        ] {
+            if let Some(value) = self.fields.get(name) {
+                body.insert(name.to_owned(), value.clone());
+            }
+        }
+        // Only the effort was measured; the summary and the cross-turn context
+        // are OpenAI's own.
+        if let Some(Value::Object(reasoning)) = self.fields.get("reasoning")
+            && let Some(effort) = reasoning.get("effort")
+        {
+            body.insert(
+                "reasoning".into(),
+                Value::Object(Map::from_iter([("effort".to_owned(), effort.clone())])),
+            );
+        }
+        // A structured output format travels; the verbosity knob is OpenAI's.
+        if let Some(Value::Object(text)) = self.fields.get("text")
+            && let Some(format) = text.get("format")
+        {
+            body.insert(
+                "text".into(),
+                Value::Object(Map::from_iter([("format".to_owned(), format.clone())])),
+            );
+        }
+        body.insert("stream".into(), Value::Bool(true));
+        body.insert("store".into(), Value::Bool(false));
+        serde_json::to_vec(&Value::Object(body)).expect("a JSON value always serializes")
+    }
+
+    /// Whether the client asked for a constrained output format, which not
+    /// every free model can do.
+    pub fn needs_structured_output(&self) -> bool {
+        self.fields
+            .get("text")
+            .and_then(|text| text.get("format"))
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "text")
+    }
+
+    /// Which tool shapes this request carries.
+    pub fn tool_usage(&self) -> ToolUsage {
+        let mut usage = ToolUsage::default();
+        if let Some(Value::Array(tools)) = self.fields.get("tools") {
+            absorb_tools(tools, &mut usage);
+        }
+        if let Some(Value::Array(items)) = self.fields.get("input") {
+            for item in items {
+                if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                    continue;
+                }
+                usage.additional_tools = true;
+                if let Some(Value::Array(tools)) = item.get("tools") {
+                    absorb_tools(tools, &mut usage);
+                }
+            }
+        }
+        usage
+    }
+
     /// Bodies for `POST /v1/responses/input_tokens`. The sum of their counts
     /// bounds the input the request consumes.
     ///
@@ -342,6 +437,22 @@ impl CreateRequest {
             bodies.push(Value::Object(body));
         }
         bodies
+    }
+}
+
+fn absorb_tools(tools: &[Value], usage: &mut ToolUsage) {
+    for tool in tools {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") => usage.function = true,
+            Some("custom") => usage.custom = true,
+            Some("namespace") => {
+                usage.namespace = true;
+                if let Some(Value::Array(nested)) = tool.get("tools") {
+                    absorb_tools(nested, usage);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1761,6 +1872,99 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].get("max_output_tokens").is_none());
         assert!(bodies[0].get("stream").is_none());
+    }
+
+    #[test]
+    fn the_openrouter_body_leaves_out_what_openai_alone_needs() {
+        let request = parse(codex_lite()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&request.openrouter_body("nex-agi/nex-n2.5-pro:free")).unwrap();
+
+        assert_eq!(body["model"], "nex-agi/nex-n2.5-pro:free");
+        assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["store"], false,
+            "OpenRouter refuses store: true outright"
+        );
+        assert!(body.get("background").is_none());
+        assert!(body.get("service_tier").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("include").is_none());
+        // Only the measured part of each OpenAI-shaped knob travels.
+        assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+        assert!(
+            body.get("text").is_none(),
+            "verbosity alone does not travel"
+        );
+        assert_eq!(body["input"], upstream(&request)["input"]);
+    }
+
+    #[test]
+    fn an_output_schema_travels_to_openrouter() {
+        let format = json!({"type": "json_schema", "name": "answer", "schema": {"type": "object"}});
+        let request = parse(json!({
+            "model": "gpt-5.6-terra", "input": "hi", "stream": true,
+            "text": {"verbosity": "low", "format": format.clone()}
+        }))
+        .unwrap();
+        let body: Value = serde_json::from_slice(&request.openrouter_body("x/y:free")).unwrap();
+        assert_eq!(body["text"], json!({"format": format}));
+    }
+
+    #[test]
+    fn tool_usage_finds_every_shape_wherever_it_is_declared() {
+        assert_eq!(
+            parse(codex_lite()).unwrap().tool_usage(),
+            ToolUsage {
+                function: true,
+                custom: true,
+                namespace: true,
+                additional_tools: true
+            },
+            "Codex declares a namespace of function and custom tools in an additional_tools item"
+        );
+
+        assert_eq!(
+            parse(openclaw()).unwrap().tool_usage(),
+            ToolUsage {
+                function: true,
+                ..ToolUsage::default()
+            }
+        );
+
+        let plain = parse(json!({"model": "m", "input": "hi", "stream": true})).unwrap();
+        assert_eq!(plain.tool_usage(), ToolUsage::default());
+
+        let top_level_custom = parse(json!({
+            "model": "m", "input": "hi", "stream": true, "tools": [custom_tool()]
+        }))
+        .unwrap();
+        assert_eq!(
+            top_level_custom.tool_usage(),
+            ToolUsage {
+                custom: true,
+                ..ToolUsage::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_structured_output_is_visible_to_the_router() {
+        let plain = parse(json!({"model": "m", "input": "hi", "stream": true})).unwrap();
+        assert!(!plain.needs_structured_output());
+
+        let text_format = parse(json!({
+            "model": "m", "input": "hi", "stream": true, "text": {"format": {"type": "text"}}
+        }))
+        .unwrap();
+        assert!(!text_format.needs_structured_output());
+
+        let schema = parse(json!({
+            "model": "m", "input": "hi", "stream": true,
+            "text": {"format": {"type": "json_schema", "name": "a", "schema": {"type": "object"}}}
+        }))
+        .unwrap();
+        assert!(schema.needs_structured_output());
     }
 
     #[test]

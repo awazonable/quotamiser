@@ -28,7 +28,9 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 
 **OpenAI 経路が動く。** 予約台帳（[`crates/ledger`](crates/ledger)）、日付境界と負債の算定（[`crates/admission`](crates/admission)）、受け口の allowlist と正規化（[`crates/protocol`](crates/protocol)）、admission・送信・精算・HTTP の受け口（[`crates/proxy`](crates/proxy)）を実装済み。
 
-**未実装:** OpenRouter と Local への fallback、ルータ、Chat Completions の受け口。無料枠を使い切ったときは次の Provider へ退避せず、429 を返す。
+**OpenRouter への退避も動く。** OpenAI の枠が足りないとき、要求の形を受けられる無料モデルがあれば OpenRouter へ回す。
+
+**未実装:** Local LLM への退避、Chat Completions の受け口。どちらの経路も使えないときは 429 を返す。
 
 2026-09-12 にローカルで起動し、1 件を実際に通して確認した。入力 13 トークンを上流の counter で数え、出力上限 64 と合わせて **77 を予約**してから送信し、終端イベントの usage（in 13 / out 5）で **18 を精算**、残りは解放された。
 
@@ -115,6 +117,19 @@ wire_api = "responses"
 あわせて、deferred tool を持つ MCP server と app をこのプロファイルから外す（入っていると Codex が `tool_search` を送り、拒否される）。この設定は Codex 0.154.0 のソースから導いたもので、**Codex を実際に通した確認はまだ行っていない**。
 
 **OpenClaw。** base URL を `http://127.0.0.1:8787/v1` に向け、`previous_response_id` による継続を使わない構成にする（サーバ側に保存された文脈は、送信前に入力量を確定できないため受理しない）。
+
+### 8. OpenRouter への退避
+
+OpenAI の枠が足りないとき、**要求の形を受けられる無料モデルがあれば** OpenRouter へ回す。設定は [`quotamiser.example.toml`](quotamiser.example.toml) の `[openrouter]` 節で、節ごと消せば OpenAI だけで動く。
+
+- **回数で数える。** OpenRouter の無料枠はトークンではなく**リクエスト回数**（無入金の口座で 1 日 50 回、1 分 20 回）。**失敗したリクエストも 1 回を消費する**ため、送信前に 1 回ぶんを確保し、結果によらず戻さない。上流に残量を照会する手段が無いので、回数は自前で数える。
+- **送る前に形を見る。** `custom` tool（Codex の `apply_patch`）は、OpenRouter の背後の provider が受理しないことを実測した。こうしたリクエストは**送らずに**断る。送って 400 を踏めば、それだけで 1 回を失うため。モデルごとの対応可否は設定に**実測値**として書く。測っていない能力は既定で「無い」。
+- **経路が開く条件。** free tier であること、購入 credits が 0 であること、（management key を設定した場合に）BYOK endpoint が無いこと。TTL で再確認し、確認できなければ閉じる。auto top-up の設定を返す API は見つからなかったので直接は見ない。top-up が起きれば credits が 0 を超え、次の確認で閉じる。
+- **退避しないもの。** 受理範囲による 400 や未設定モデルは、別の Provider でも同じく誤りなので退避しない。`custom` tool を含むリクエストも退避できないため、**Codex の全 tool 構成は OpenRouter では動かない**。
+
+応答の `x-quotamiser-provider` が `openrouter`、`x-quotamiser-model` が実際に使われた `:free` モデル ID になる。
+
+2026-09-12 に実測で確認した。日次枠を 10 トークンだけにした設定で平文のリクエストを送ると、OpenAI 側が枠不足で断り、`nex-agi/nex-n2.5-pro:free` が応答を返し（`x-quotamiser-provider: openrouter`）、台帳の回数は 1 増えた。`custom` tool を含むリクエストは 429 で断られ、**回数は 1 のまま**だった。
 
 要件は [`docs/requirements/requirements.md`](docs/requirements/requirements.md)、設計は [`docs/design/design.md`](docs/design/design.md)、判断の記録は [`docs/adr/`](docs/adr/) を参照。
 

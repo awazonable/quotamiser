@@ -75,11 +75,15 @@ v1 の Responses 受け口の正規の成果物は [`crates/protocol/src/request
 - 次のフィールドを拒否する: `plugins`、`transforms`、`provider`、`models`、`fallbacks`、preset 指定、および `openrouter:web_search` / `openrouter:web_fetch` 等のサーバ側 tool。
 - **OpenAI 標準の `web_search` tool type も拒否する。** OpenRouter がこれを課金対象のサーバ側 tool へ自動昇格させるため、素通しは課金に直結する。
 - PDF / ファイル入力を拒否する（engine 未指定時に有料 OCR へ自動フォールバックするため）。
+- **Responses API で送る。** 変換アダプタは挟まない。ただし OpenAI 向けの最終 payload をそのまま送らず、Provider 別の egress policy とする。`store: false` とし、`background` と `service_tier` は付けない。実測で通っていない knob（`prompt_cache_key`、`include`、`reasoning.summary` と `reasoning.context`、`text.verbosity`）は落とす（[ADR-0009](../adr/0009-openrouter-as-a-request-counted-route.md)）。
+- **`custom` tool を含むリクエストは送らない。** 背後の provider が受理しないことを実測した。400 を踏むこと自体が 1 日 50 回の枠を 1 消費するため、事前に判定して送らない。
+- **モデルごとの対応可否は実測値として設定に持つ。** `supported_parameters` は provider 実装の違いまで保証しない。測っていない能力は既定で「無い」とする。
+- **回数は自前で数える。** 上流に残量を照会する手段が無く、成功応答にレート制限ヘッダも付かない。1 日 50 回は永続カウンタで、1 分 20 回は送信前の窓で抑える。
 - **Guardrails をサーバ強制の防壁として設定する。** モデル allowlist を同内容で設定し、USD budget も設定する。**$0 は設定できないことを確認済み**であるため正の最小値を用いる。したがって Guardrails は「課金を不可能にする装置」ではなく「暴走時の被害を有限に抑える装置」である。課金ゼロは、前払い・無入金であることと allowlist が担う。
 
 ### 残存リスクとして記録する
 
-- Free Models Router（`openrouter/free`）は、要求機能に合致する無料モデルが無い場合の挙動が文書化されていない。有料へ遷移しないという明示的な保証は無い。
+- Free Models Router（`openrouter/free`）は、現在の公式文書では「利用可能な無料モデルから選ぶ zero-cost inference」と定義されており、当初記録した「有料へ遷移しうる」という懸念は文書上は解消している。ただし**どのモデルが当たるかは要求ごとに変わる**ため、品質が安定しない。**第一候補にはせず、列挙した `:free` モデルの後ろの catch-all として置く**。実測でも、同じ形が named model では 400、`openrouter/free` では 200 になる差が出た。
 - OpenRouter のアカウント既定 plugin と privacy 設定は、リクエスト検査では防げない。前払い・無入金であることが唯一の構造的防壁である。
 
 ## 稼働前提の継続検証
@@ -93,6 +97,7 @@ v1 の Responses 受け口の正規の成果物は [`crates/protocol/src/request
 - **Data Sharing の有効性と、対象 project の opt-in 状態。** 所有者がいつでも opt-out でき、opt-out されても API は正常に応答し、usage も台帳と一致したまま**全トークンが課金される**。TTL 超過または取得失敗で **OpenAI 経路を閉じる**。
 - **モデルの同一性と諸元。** Pool 所属、**最大出力トークン数**、context 上限、tokenizer の同一性を**版に束ねて**保持し、受理前に一括で検証する。モデル ID や alias が別の版へ移り最大出力が変われば、こちらは 128,000 を予約したまま上流が 200,000 を出力しうる（QuotaMiser は上限値を送らないため、上流はこちらの想定を知らない）。**不変のモデルスナップショットのみを受理する**か、諸元を版付きの安全入力として扱う。
 - **OpenRouter アカウントの残高・BYOK・auto top-up。** 検証失敗で OpenRouter 経路を閉じる。
+  実測（2026-09-12）で取得手段が分かれた。**free tier であることと購入 credits が 0 であることは inference key で読める**（`GET /api/v1/key`、`GET /api/v1/credits`）。**BYOK の列挙には management key が要る**（inference key では 401）ため、management key が未設定なら BYOK は「未確認」として記録し、確認済みとは扱わない。**auto top-up の ON/OFF を返す endpoint は見つからなかった**ので、これを自動確認の対象にはしない。top-up が起きれば credits が 0 を超えるため、credits の確認がその代理となる（[ADR-0009](../adr/0009-openrouter-as-a-request-counted-route.md)）。
 - **上限超過の不具合が未解決であるモデル。** 対象から外すか、別途証明された固い上限に対して予約する。
 
 ## 機能要件
@@ -367,6 +372,25 @@ Provider ごとに**対応機能の表**を保持し、ルーティング前に�
 | prompt cache | 1,024 トークン以上の同じ prefix を 2 回送ると、1 回目は `cache_write_tokens`、2 回目は `cached_tokens` に計上され、`input_tokens` はどちらも含む総数だった。Costs API では `cache writes` と `cached input` の line item がそれぞれ数量を持ち、金額 $0 |
 
 **tool を伴うリクエストの観察は、1 モデル・1 日・9 件に留まる。** 無料枠が tool を伴うリクエストに適用されることを、この観察を超えて一般化しない。他のモデル、枠を使い切った後、tool の種類や数が大きく異なる場合は確かめていない。当日の cost は、日次の集計が締まった後に再確認する。
+
+### OpenRouter の Responses 対応とアカウント（2026-09-12）
+
+`nex-agi/nex-n2.5-pro:free`（named model）と `openrouter/free`（catch-all）に対して実測。成功した応答はすべて `cost: 0`、`is_byok: false`。
+
+| 項目 | 結果 |
+| --- | --- |
+| Responses endpoint | `POST /api/v1/responses` は **stream・reasoning・function tool を受理**（両モデルで 200） |
+| **`custom` tool** | **拒否される。** named model では provider が Chat Completions の function 形として解釈し `tools[0].function: missing field 'parameters'`、`openrouter/free` では `expected "function"`（Cohere）/ `unknown variant 'custom'`（Nvidia）。**Codex の `apply_patch` は custom なので、この形は OpenRouter へ送れない** |
+| `namespace` / `additional_tools` | 中身が `function` のみなら **200**（両モデル）。`custom` を含むと上の理由で 400。当初の 400 は custom の混入によるもので、形そのものは通る |
+| `store` / `background` | **`store: true` は拒否**（`store: Invalid input: expected false`）。OpenAI 経路の retrieve による精算機構はここでは使えず、回数建てなので必要も無い |
+| `max_output_tokens` | 尊重される（上限到達で `incomplete`） |
+| rate limit ヘッダ | 成功応答には**返らない**。20 RPM は送信前に自前で抑えるほかない |
+| アカウント照会 | `GET /api/v1/key` は inference key で読め、`is_free_tier: true`、`usage: 0`。`GET /api/v1/credits` も **inference key で読めた**（`total_credits: 0`）。`GET /api/v1/byok` は **management key が必要**（inference key では 401） |
+| 残り回数の照会 | 14 リクエスト送っても `/key` の `usage_daily` は 0、`limit_remaining` は `null`。**1 日 50 回の残量を上流から読む手段は無い**ため、回数は自前で数えるほかない |
+| auto top-up | ON/OFF を返す endpoint は、公開文書と実測の範囲で**見つからない**（dashboard での設定、閾値は最低 $2） |
+| `:free` の一覧 | 445 モデル中 19 が `:free`、うち 18 が `tools` を宣言。`openrouter/free` も存在し `tools` / `structured_outputs` / `reasoning` を宣言する |
+
+**測定は 2 モデルに留まる。** `:free` モデルごとに背後の provider 実装が違い、同じ形でも結果が変わる（上の custom の 400 がまさにそれ）。したがって**モデルごとの対応可否は、推測ではなく実測値として設定に持つ**。
 
 ## 未解決の事項
 

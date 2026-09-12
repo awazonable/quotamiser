@@ -51,14 +51,7 @@ pub struct DispatchPermit {
 
 impl DispatchPermit {
     /// Binds a reservation to the exact canonical body its liability was
-    /// computed for.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "admission, which creates permits, is not written yet"
-        )
-    )]
+    /// computed for. Only admission, which holds the reservation, makes one.
     pub(crate) fn new(reservation: ReservationId, body: Bytes, accounting_rev: i64) -> Self {
         Self {
             reservation,

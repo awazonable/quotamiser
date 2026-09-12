@@ -30,6 +30,12 @@ use crate::error_body;
 /// Changes whenever what is accepted changes.
 pub const ALLOWLIST_VERSION: &str = "responses-ingress/1";
 
+/// The service tier every upstream request is sent with, and the one
+/// settlement expects the terminal event to report. Sending `auto`, or
+/// nothing, reports `auto` until the terminal event and `default` in it, which
+/// would fail validation on the first settlement.
+pub const UPSTREAM_SERVICE_TIER: &str = "default";
+
 /// The hint for fields only Codex's built-in `openai` provider sends.
 const CODEX_PROVIDER_HINT: &str = "If this request comes from Codex, configure QuotaMiser as a custom model provider rather than overriding the built-in `openai` provider.";
 
@@ -286,7 +292,10 @@ impl CreateRequest {
         body.insert("background".into(), Value::Bool(true));
         body.insert("store".into(), Value::Bool(true));
         body.insert("stream".into(), Value::Bool(true));
-        body.insert("service_tier".into(), Value::String("default".into()));
+        body.insert(
+            "service_tier".into(),
+            Value::String(UPSTREAM_SERVICE_TIER.into()),
+        );
         serde_json::to_vec(&Value::Object(body)).expect("a JSON value always serializes")
     }
 

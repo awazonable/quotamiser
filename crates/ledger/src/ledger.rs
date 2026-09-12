@@ -221,6 +221,12 @@ impl Ledger {
     /// Marks the shutdown clean. A ledger that fails its integrity check is
     /// never marked clean.
     pub fn close(self) -> Result<()> {
+        self.mark_clean_shutdown()
+    }
+
+    /// The same mark, for a ledger held behind a shared handle that cannot be
+    /// consumed. Only call it when nothing further will be written.
+    pub fn mark_clean_shutdown(&self) -> Result<()> {
         self.check_integrity()?;
         self.conn
             .execute("UPDATE ledger_meta SET clean_shutdown = 1 WHERE id = 1", [])?;

@@ -14,3 +14,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# local configuration and ledger state
+/quotamiser.toml
+/quotamiser.*.toml
+/state/
+/state-*/

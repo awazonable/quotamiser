@@ -1,0 +1,127 @@
+# QuotaMiser configuration. Copy to `quotamiser.toml` and edit.
+#
+# Credentials are never written here: the file names the environment variables
+# that carry them. A `.env` file beside this one is read at startup for any
+# that are not already set in the environment.
+#
+# Unknown keys stop startup rather than being ignored.
+
+[server]
+# Loopback only. There is no authentication, so this must not be reachable
+# from the network.
+bind = "127.0.0.1:8787"
+
+[upstream]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# Read-only, and used only for the Usage API: recovering a day's consumption
+# and checking that traffic is still served from the free grant.
+admin_key_env = "OPENAI_ADMIN_KEY"
+# The data-sharing project, when the organization has more than one.
+# project = "proj_..."
+connect_timeout_seconds = 10
+read_timeout_seconds = 120
+
+[ledger]
+path = "state/ledger.db"
+# MUST be on a different volume from `path`: the external record is what tells
+# a restored ledger from an intact one, and a volume that loses one would
+# otherwise lose both.
+external_record_path = "D:/quotamiser/external/hwm"
+lock_dir = "state/locks"
+# The organization whose grant this ledger is the inventory for. QuotaMiser
+# assumes it is the only thing spending that organization's grant.
+organization = "org-REPLACE-ME"
+# Test machines with a single volume only. This voids the guarantee above.
+# allow_same_volume_external_record = true
+
+# Daily grants. Tier 1 data sharing: 250,000 across the large models and
+# 2,500,000 across the small ones. Check your own tier before trusting these.
+[[pool]]
+id = "openai:large"
+granted_per_day = 250000
+
+[[pool]]
+id = "openai:small"
+granted_per_day = 2500000
+
+# Every model QuotaMiser will serve, with the pool it draws on and the most it
+# can emit. A request that names no cap of its own reserves `max_output_tokens`,
+# so an understated value here would break the guarantee.
+[[model]]
+id = "gpt-5.6-terra"
+pool = "openai:small"
+max_output_tokens = 128000
+# Only for a model whose encoding is known to cover all 256 byte values, which
+# lets a flat text request skip the provider's counter. GPT-5.6's encoding is
+# unpublished, so it stays false.
+byte_level_encoding_known = false
+
+[[model]]
+id = "gpt-5.6-luna"
+pool = "openai:small"
+max_output_tokens = 128000
+
+[[model]]
+id = "gpt-5.6-sol"
+pool = "openai:large"
+max_output_tokens = 128000
+
+# The second free route. Remove this section to run on OpenAI alone.
+#
+# OpenRouter's free allowance is counted in REQUESTS, not tokens: 50 a day on an
+# account that has never bought credits. A request that fails spends one just
+# the same, so QuotaMiser takes a slot before sending and never gives it back.
+#
+# The route stays closed unless the account makes paid use impossible: free
+# tier, no purchased credits, and — when a management key is configured — no
+# BYOK endpoints. Auto top-up has no endpoint that reports it, so it is not
+# checked directly; a top-up that fired would appear here as credits above zero.
+[openrouter]
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_TOKEN"
+# Optional. Only a management key can list BYOK endpoints; without one, BYOK is
+# recorded as unchecked rather than assumed absent.
+# management_key_env = "OPENROUTER_MANAGEMENT_KEY"
+daily_request_limit = 50
+# OpenRouter returns no rate-limit headers on success, so the short window is
+# enforced before sending rather than after a 429.
+max_requests_per_window = 20
+window_seconds = 60
+account_ttl_seconds = 900
+
+# Ordered: the first model whose capabilities cover a request is used, so the
+# catch-all router belongs last. These flags are what a model was MEASURED to
+# accept, not what it advertises — the providers behind one id differ.
+#
+# Measured 2026-09-12: the providers refuse `custom` tools, which is what Codex
+# declares apply_patch as. Such requests are never sent here; finding out by
+# being refused would spend one of the fifty.
+[[openrouter.model]]
+id = "nex-agi/nex-n2.5-pro:free"
+function_tools = true
+custom_tools = false
+namespace_tools = true
+structured_outputs = false   # not measured yet
+
+[[openrouter.model]]
+id = "openrouter/free"
+function_tools = true
+custom_tools = false
+namespace_tools = true
+structured_outputs = false   # not measured yet
+
+[clock]
+# The day boundary is decided from the provider's clock, never the local one.
+reading_uncertainty_seconds = 5
+# The next day's pool is never opened sooner than this after the reset.
+open_delay_seconds = 300
+max_reading_age_seconds = 900
+refresh_seconds = 120
+
+[safety]
+# How long a data-sharing check stands before admission refuses everything.
+data_sharing_ttl_seconds = 900
+# The liability one verification may cover, as a fraction of the day's grant.
+liability_budget_divisor = 4

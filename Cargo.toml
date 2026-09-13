@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/admission", "crates/ledger", "crates/protocol", "crates/proxy"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false

@@ -1,0 +1,13 @@
+[package]
+name = "quotamiser-admission"
+version = "0.1.0"
+description = "Pure admission logic for QuotaMiser: epoch boundaries and liability bounds. No I/O."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = "2.0.20"
+
+[dev-dependencies]
+proptest = "1.11.0"

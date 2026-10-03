@@ -34,10 +34,10 @@ pub enum ConfigError {
     MissingCredential(String),
     #[error("`bind` is not an address: {0}")]
     BadBindAddress(String),
-    #[error(
-        "`bind` must be a loopback address: QuotaMiser has no authentication, so it must not be reachable from the network"
-    )]
+    #[error("non-loopback `bind` requires `allow_lan = true` and LAN access controls")]
     NotLoopback,
+    #[error("invalid LAN configuration: {0}")]
+    Lan(&'static str),
     #[error("at least one pool and one model must be configured")]
     Empty,
     #[error("model {model} names pool {pool}, which is not configured")]
@@ -82,8 +82,14 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// Loopback only. There is no authentication.
+    /// Loopback by default; LAN access requires explicit controls.
     pub bind: String,
+    #[serde(default)]
+    pub allow_lan: bool,
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    #[serde(default)]
+    pub allowed_client_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +160,19 @@ pub struct Safety {
     /// day's grant: 4 means a quarter of it.
     #[serde(default = "four")]
     pub liability_budget_divisor: u64,
+    /// Requests with an explicit output cap at or below this value use a
+    /// synchronous upstream response. If the client disconnects, the
+    /// reserved liability is written off instead of waiting for retrieval.
+    #[serde(default = "five_hundred_twelve")]
+    pub synchronous_max_output_tokens: u64,
+    /// Flat synchronous requests larger than this UTF-8 byte size still use
+    /// the provider's exact input counter.
+    #[serde(default = "four_thousand_ninety_six")]
+    pub synchronous_max_input_bytes: u64,
+    /// Flat synchronous requests with more characters still use the exact
+    /// input counter. This keeps the low-latency window around short turns.
+    #[serde(default = "one_thousand_twenty_four")]
+    pub synchronous_max_input_characters: u64,
 }
 
 impl Default for Safety {
@@ -161,6 +180,9 @@ impl Default for Safety {
         Self {
             data_sharing_ttl_seconds: nine_hundred_u64(),
             liability_budget_divisor: four(),
+            synchronous_max_output_tokens: five_hundred_twelve(),
+            synchronous_max_input_bytes: four_thousand_ninety_six(),
+            synchronous_max_input_characters: one_thousand_twenty_four(),
         }
     }
 }
@@ -253,6 +275,15 @@ fn sixty() -> i64 {
 fn four() -> u64 {
     4
 }
+fn five_hundred_twelve() -> u64 {
+    512
+}
+fn four_thousand_ninety_six() -> u64 {
+    4_096
+}
+fn one_thousand_twenty_four() -> u64 {
+    1_024
+}
 fn five() -> i64 {
     5
 }
@@ -286,6 +317,7 @@ pub struct CatalogEntry {
 /// The configuration, checked and turned into the shapes the runtime uses.
 pub struct Resolved {
     pub bind: SocketAddr,
+    pub lan: Option<std::sync::Arc<crate::lan::Access>>,
     pub upstream: UpstreamConfig,
     pub admin_key: String,
     pub usage_base_url: String,
@@ -294,6 +326,9 @@ pub struct Resolved {
     pub clock_refresh: Duration,
     pub data_sharing_ttl: i64,
     pub safety_budget_divisor: u64,
+    pub synchronous_max_output_tokens: u64,
+    pub synchronous_max_input_bytes: u64,
+    pub synchronous_max_input_characters: u64,
     /// Pool grants for a day, in the order the ledger is given them.
     pub grants: Vec<(String, u64)>,
     pub catalog: HashMap<String, CatalogEntry>,
@@ -347,9 +382,11 @@ impl Config {
             .bind
             .parse()
             .map_err(|_| ConfigError::BadBindAddress(self.server.bind.clone()))?;
-        if !bind.ip().is_loopback() {
+        if !self.server.allow_lan && !bind.ip().is_loopback() {
             return Err(ConfigError::NotLoopback);
         }
+
+        let lan = crate::lan::resolve(&self.server, bind)?;
 
         let api_key = credential(&self.upstream.api_key_env)?;
         let admin_key = credential(&self.upstream.admin_key_env)?;
@@ -441,12 +478,31 @@ impl Config {
             self.clock.max_reading_age_seconds,
         )?;
 
+        if let Some(access) = &lan {
+            let mut credentials = vec![api_key.as_str(), admin_key.as_str()];
+            if let Some(route) = &openrouter {
+                credentials.push(&route.api_key);
+                if let Some(key) = &route.management_key {
+                    credentials.push(key);
+                }
+            }
+            if credentials
+                .iter()
+                .any(|key| access.matches_token(key.as_bytes()))
+            {
+                return Err(ConfigError::Lan(
+                    "LAN token must differ from provider credentials",
+                ));
+            }
+        }
+
         // The Usage API is not under the version prefix the inference base URL
         // carries, but it shares its origin.
         let usage_base_url = self.upstream.base_url.trim_end_matches('/').to_string();
 
         Ok(Resolved {
             bind,
+            lan,
             upstream: UpstreamConfig {
                 base_url: self.upstream.base_url.clone(),
                 api_key,
@@ -469,6 +525,9 @@ impl Config {
             data_sharing_ttl: i64::try_from(self.safety.data_sharing_ttl_seconds)
                 .unwrap_or(i64::MAX),
             safety_budget_divisor: self.safety.liability_budget_divisor.max(1),
+            synchronous_max_output_tokens: self.safety.synchronous_max_output_tokens,
+            synchronous_max_input_bytes: self.safety.synchronous_max_input_bytes,
+            synchronous_max_input_characters: self.safety.synchronous_max_input_characters,
             grants,
             catalog,
             openrouter,
@@ -534,6 +593,10 @@ max_output_tokens = 128000
             std::env::set_var("QM_TEST_KEY", "sk-test");
             std::env::set_var("QM_TEST_ADMIN", "sk-admin-test");
             std::env::set_var("QM_TEST_OR", "sk-or-test");
+            std::env::set_var(
+                "QM_TEST_LAN",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
         }
         body()
     }
@@ -557,6 +620,20 @@ max_output_tokens = 128000
             "an unpublished encoding is not assumed"
         );
         assert_eq!(resolved.ledger.pools, vec!["openai:small".to_string()]);
+        assert_eq!(resolved.synchronous_max_output_tokens, 512);
+        assert_eq!(resolved.synchronous_max_input_bytes, 4_096);
+        assert_eq!(resolved.synchronous_max_input_characters, 1_024);
+    }
+
+    #[test]
+    fn synchronous_output_threshold_is_configurable() {
+        let text = format!(
+            "{SAMPLE}\n[safety]\nsynchronous_max_output_tokens = 128\nsynchronous_max_input_bytes = 1024\nsynchronous_max_input_characters = 512\n"
+        );
+        let resolved = with_credentials(|| parse(&text).resolve().expect("resolves"));
+        assert_eq!(resolved.synchronous_max_output_tokens, 128);
+        assert_eq!(resolved.synchronous_max_input_bytes, 1_024);
+        assert_eq!(resolved.synchronous_max_input_characters, 512);
     }
 
     #[test]
@@ -572,6 +649,43 @@ max_output_tokens = 128000
         let text = SAMPLE.replace("127.0.0.1:8787", "0.0.0.0:8787");
         let error = with_credentials(|| refuse(parse(&text)));
         assert!(matches!(error, ConfigError::NotLoopback));
+    }
+
+    #[test]
+    fn lan_configuration_resolves_only_with_independent_credentials() {
+        let text = SAMPLE.replace(
+            "bind = \"127.0.0.1:8787\"",
+            "bind = \"0.0.0.0:8787\"\nallow_lan = true\nauth_token_env = \"QM_TEST_LAN\"\nallowed_client_cidrs = [\"192.168.1.0/24\"]",
+        );
+        with_credentials(|| {
+            assert!(parse(&text).resolve().unwrap().lan.is_some());
+            for bind in [
+                "192.168.1.10:8787",
+                "[fd12::1]:8787",
+                "[::]:8787",
+                "127.0.0.1:8787",
+            ] {
+                assert!(parse(&text.replace("0.0.0.0:8787", bind)).resolve().is_ok());
+            }
+            let same_key = text.replace(
+                "api_key_env = \"QM_TEST_KEY\"",
+                "api_key_env = \"QM_TEST_LAN\"",
+            );
+            assert!(matches!(refuse(parse(&same_key)), ConfigError::Lan(_)));
+            let missing = text.replace(
+                "auth_token_env = \"QM_TEST_LAN\"",
+                "auth_token_env = \"QM_TEST_LAN_ABSENT\"",
+            );
+            assert!(matches!(
+                refuse(parse(&missing)),
+                ConfigError::MissingCredential(_)
+            ));
+            let invalid = text.replace(
+                "auth_token_env = \"QM_TEST_LAN\"",
+                "auth_token_env = \"QM_TEST_KEY\"",
+            );
+            assert!(matches!(refuse(parse(&invalid)), ConfigError::Lan(_)));
+        });
     }
 
     #[test]

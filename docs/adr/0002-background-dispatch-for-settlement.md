@@ -1,6 +1,6 @@
-# ADR-0002: 上流へは `background: true` で送り、切断時は cancel して精算する
+# ADR-0002: 上流の background 応答を回収経路に使う
 
-- Status: Accepted
+- Status: Accepted for the background recovery mode; bounded synchronous mode is added by [ADR-0010](0010-bounded-synchronous-responses.md)
 - Date: 2026-09-10
 
 ## Context
@@ -13,7 +13,7 @@
 
 ## Decision
 
-**上流へのリクエストは `background: true`、`store: true` で発行する。クライアント切断時は `POST /v1/responses/{id}/cancel` で生成を停止し、`GET /v1/responses/{id}` で権威ある usage を取得して精算する。**
+**回収経路を選ぶリクエストは `background: true`、`store: true` で発行する。クライアント切断時は `POST /v1/responses/{id}/cancel` で生成を停止し、`GET /v1/responses/{id}` で権威ある usage を取得して精算する。**
 
 クライアントへの streaming は background 応答のストリームを中継する形で提供する。
 
@@ -29,7 +29,7 @@
 
 対照として、通常完了した応答は retrieve できることを確認した。つまり retrieve 機構自体は正常で、**中断された同期ストリームの応答だけが取得できない**。
 
-したがって当初の前提は成り立たない。cancel を伴う background だけが、生成の浪費を止めつつ正確な精算を可能にする。
+したがって当初の前提は成り立たない。cancel を伴う background だけが、生成の浪費を止めつつ正確な精算を可能にする。この判断を大きな出力上限のリクエストに適用する。
 
 ## Alternatives considered
 

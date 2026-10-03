@@ -34,23 +34,34 @@ async fn run(path: &Path) -> Result<(), String> {
     }
     let resolved = config.resolve().map_err(|error| error.to_string())?;
     let bind = resolved.bind;
+    let lan_access = resolved.lan.clone();
 
     let runtime = Arc::new(
         Runtime::start(resolved)
             .await
             .map_err(|error| error.to_string())?,
     );
-    let app = server::router(runtime.clone());
+    let mut app = server::router(runtime.clone());
+    if let Some(access) = &lan_access {
+        app = quotamiser_proxy::lan::protect(app, access.clone());
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| format!("could not bind {bind}: {error}"))?;
     println!("[quotamiser] listening on http://{bind}");
 
-    let serving = axum::serve(listener, app).with_graceful_shutdown(async {
+    let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
         println!("[quotamiser] stopping");
-    });
-    let result = serving.await.map_err(|error| error.to_string());
+    };
+    let result = if lan_access.is_some() {
+        quotamiser_proxy::lan::serve(listener, app, shutdown).await
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
+    .map_err(|error| error.to_string());
     runtime.shutdown().await;
     result
 }

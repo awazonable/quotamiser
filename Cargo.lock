@@ -1066,18 +1066,24 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "http-body-util",
  "httpdate",
+ "hyper",
+ "hyper-util",
+ "ipnet",
  "quotamiser-admission",
  "quotamiser-ledger",
  "quotamiser-protocol",
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
  "toml",
+ "tower",
 ]
 
 [[package]]

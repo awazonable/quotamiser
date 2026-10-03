@@ -24,7 +24,7 @@
 - **入力項目は `message`、`reasoning`（`encrypted_content` 必須）、`function_call`、`function_call_output`、`custom_tool_call`、`custom_tool_call_output`、`additional_tools` を受理する。** それ以外（`web_search_call`、`local_shell_call`、`tool_search_call`、`compaction`、`item_reference` など）は拒否する。
 - **各入力項目の `id` と `status` を除去する。** 履歴は内容で送り、保存済み項目への参照にしない。
 - **`client_metadata` は受理して除去する。** 上流へ送らない。
-- **`store` と `service_tier` は拒否せず上書きする。** 上流には `background: true`、`store: true`、`stream: true`、`service_tier: "default"` を送る。`stream` はクライアントが `true` を送ることを要求する。
+- **`store` と `service_tier` は拒否せず上書きする。** 上流には `store: true`、`stream: true`、`service_tier: "default"` を送り、`background` は `max_output_tokens` の閾値に応じて admission が選ぶ。大きな上限または未指定なら `background: true`、短い明示上限なら `background: false` とする（[ADR-0010](0010-bounded-synchronous-responses.md)）。`stream` はクライアントが `true` を送ることを要求する。
 - `prompt_cache_options` は唯一の値であり既定値でもある `{"ttl": "30m"}` のみ受理して除去する。
 - 画像は `data:` URL のインラインのみ受理する。`reasoning.effort` は `none` から `xhigh` までに限る。
 - Codex の組み込み `openai` provider だけが送るフィールド（`stream_options`、`internal_chat_message_metadata_passthrough`、`encrypted_function_args`）は拒否し、Codex では QuotaMiser を custom model provider として設定するよう本文で示す。

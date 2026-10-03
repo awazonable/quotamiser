@@ -32,6 +32,8 @@ OpenAI 無料 Quota  →  OpenRouter 無料モデル  →  Local LLM (FreeToken 
 
 **未実装:** Local LLM への退避、Chat Completions の受け口。どちらの経路も使えないときは 429 を返す。
 
+**LAN 接続に対応。** 既定は loopback とし、明示的な LAN 有効化時には専用 Bearer token と接続元 CIDR を必須にする（[ADR-0011](docs/adr/0011-authenticated-lan-access.md)、[設計](docs/design/design.md#lan-接続の境界adr-0011)）。同じ利用者の複数端末は、同じ台帳と無料枠を共有する。設定方法は後述する。
+
 2026-09-12 にローカルで起動し、1 件を実際に通して確認した。入力 13 トークンを上流の counter で数え、出力上限 64 と合わせて **77 を予約**してから送信し、終端イベントの usage（in 13 / out 5）で **18 を精算**、残りは解放された。
 
 ## 使い方
@@ -58,6 +60,9 @@ cargo build --release -p quotamiser-proxy --bin quotamiser
 - `[ledger] external_record_path` — **台帳とは別ボリューム**に置く。台帳を失ったことを検知する外部記録であり、同じボリュームに置くと両方まとめて失われる。単一ボリュームの試用機では `allow_same_volume_external_record = true` を使うが、これはその検知を捨てる設定である
 - `[[pool]] granted_per_day` — 自分の tier の付与量。既定値は tier 1（Large 250,000 / Small 2,500,000）
 - `[[model]] max_output_tokens` — **小さく書くと保証が壊れる。** 出力上限を指定しないリクエストはこの値を予約する
+- `[safety] synchronous_max_output_tokens` — 明示された出力上限がこの値以下の短い応答は、低遅延の同期経路を使う。切断時は回収せず予約量を全額 write-off する。未指定または超過する上限は background 回収を使う（既定 512）
+- `[safety] synchronous_max_input_bytes` — 同期経路で、平坦なテキスト入力を厳密な input token 照会なしで扱う最大 UTF-8 バイト数。長い入力や構造化入力は厳密カウントへ戻る（既定 4096）
+- `[safety] synchronous_max_input_characters` — 同じ軽量窓に入れる最大 Unicode 文字数。言語によるバイト長の差を抑えるため、バイト数制限と両方を満たす必要がある（既定 1024）
 
 ### 4. 起動
 
@@ -89,6 +94,8 @@ curl -N http://127.0.0.1:8787/v1/responses \
 
 応答には、処理した Provider とモデルを `x-quotamiser-provider` / `x-quotamiser-model` で返す。
 
+LAN モードでは両 endpoint に `Authorization: Bearer <LAN token>` が必要になる。同じ待受への loopback 接続も対象となる。
+
 ### 6. 断られたとき
 
 | 状況 | 応答 |
@@ -97,6 +104,9 @@ curl -N http://127.0.0.1:8787/v1/responses \
 | 設定していないモデル | **400** `model_not_configured` |
 | 枠不足・レート制限・曖昧な失敗による冷却・日付境界 | **429** `usage_limit_reached`（分かれば `resets_at` 付き）。**送信していないので枠は減っていない** |
 | 入力を数えられない、台帳に触れない | **503**。上界が立たないので送らない |
+| LAN token が無い・不正 | **401** `authentication_error`。本文を読まず、上流へ送らない |
+| 許可外の接続元・ブラウザ Origin | **403**。上流へ送らない |
+| LAN の同時要求上限・本文受信期限・本文サイズ上限 | **429** / **408** / **413**。予約前に拒否する |
 
 ### 7. クライアント側の設定
 
@@ -130,6 +140,37 @@ OpenAI の枠が足りないとき、**要求の形を受けられる無料モ�
 応答の `x-quotamiser-provider` が `openrouter`、`x-quotamiser-model` が実際に使われた `:free` モデル ID になる。
 
 2026-09-12 に実測で確認した。日次枠を 10 トークンだけにした設定で平文のリクエストを送ると、OpenAI 側が枠不足で断り、`nex-agi/nex-n2.5-pro:free` が応答を返し（`x-quotamiser-provider: openrouter`）、台帳の回数は 1 増えた。`custom` tool を含むリクエストは 429 で断られ、**回数は 1 のまま**だった。
+
+### 9. LAN の別端末から使う
+
+サーバの `[server]` を、自分の LAN アドレスと接続元範囲に合わせて変更する。
+
+```toml
+[server]
+bind = "192.168.1.10:8787"
+allow_lan = true
+auth_token_env = "QUOTAMISER_LAN_TOKEN"
+allowed_client_cidrs = ["192.168.1.0/24"]
+```
+
+`0.0.0.0:8787` や `[::]:8787` の wildcard bind も使えるが、接続元制限は必須である。CIDR は private IPv4 または IPv6 ULA の範囲に限定する。**LAN token を OpenAI / Admin / OpenRouter key と共有しない。** PowerShell 7 では、起動するシェルに次のように専用 token を生成できる（値は表示しない）。
+
+```powershell
+$env:QUOTAMISER_LAN_TOKEN = [Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+./target/release/quotamiser.exe quotamiser.toml
+```
+
+再起動後も使う場合は設定ファイルの隣の `.env` に `QUOTAMISER_LAN_TOKEN=<生成した値>` を安全に保存し、利用する別端末にも同じ値を設定する。token を変更したらサーバを再起動する。サーバの firewall は必要なポートと接続元範囲だけを許可する。**平文 HTTP は信頼する隔離 LAN に限定し、共有 Wi-Fi 等では HTTPS reverse proxy を使う。** proxy は接続元制限を行い、Authorization を渡し、backend は HTTP/1.1、SSE buffering は無効にする。
+
+別端末からの接続確認（その端末の環境変数に同じ token を設定済みとする）:
+
+```powershell
+curl.exe http://192.168.1.10:8787/v1/models -H "Authorization: Bearer $env:QUOTAMISER_LAN_TOKEN"
+```
+
+既存クライアントも base URL を `http://192.168.1.10:8787/v1` に変更し、専用 token を Bearer credential として設定する。Origin を持つブラウザ要求は拒否する。同時接続と処理中の要求は各 32、ヘッダ・idle・本文の受信期限は各 30 秒であり、SSE 応答には本文受信期限を適用しない。ネイティブの受け口は HTTP/1.1 のみである。
+
+自動テストはアクセス制御と localhost の実 TCP 接続で受信期限・接続上限・SSE 継続を検証する。別端末と実際の firewall / TLS proxy を含む接続は、LAN 有効化後に運用環境で確認する。
 
 要件は [`docs/requirements/requirements.md`](docs/requirements/requirements.md)、設計は [`docs/design/design.md`](docs/design/design.md)、判断の記録は [`docs/adr/`](docs/adr/) を参照。
 

@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod dispatch;
 pub mod failure_breaker;
+pub mod lan;
 pub mod ledger_handle;
 pub mod openrouter;
 pub mod openrouter_dispatch;

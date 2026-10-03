@@ -31,7 +31,7 @@ use crate::runtime::Runtime;
 
 /// Codex sends its whole conversation every turn, so the cap is generous;
 /// it exists to stop an unbounded body, not to shape usage.
-const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 const PROVIDER_HEADER: &str = "x-quotamiser-provider";
 const MODEL_HEADER: &str = "x-quotamiser-model";

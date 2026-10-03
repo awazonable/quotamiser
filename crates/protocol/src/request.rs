@@ -297,13 +297,18 @@ impl CreateRequest {
         })
     }
 
-    /// The canonical body sent to OpenAI: the normalized client fields, then
-    /// the fields QuotaMiser fixes. Background mode and storage let a response
-    /// be cancelled and settled after the client disconnects (ADR-0002), and
-    /// the service tier is the one the settlement check expects.
+    /// The canonical body sent to OpenAI using the normal recovery mode.
     pub fn openai_body(&self) -> Vec<u8> {
+        self.openai_body_with_background(true)
+    }
+
+    /// The canonical body sent to OpenAI with an explicit background choice.
+    /// Storage remains enabled in both modes so a completed response can still
+    /// be retrieved; only background execution is relaxed for small, bounded
+    /// responses.
+    pub fn openai_body_with_background(&self, background: bool) -> Vec<u8> {
         let mut body = self.fields.clone();
-        body.insert("background".into(), Value::Bool(true));
+        body.insert("background".into(), Value::Bool(background));
         body.insert("store".into(), Value::Bool(true));
         body.insert("stream".into(), Value::Bool(true));
         body.insert(
@@ -1428,6 +1433,22 @@ mod tests {
             body["input"][0],
             json!({"role": "user", "content": [{"type": "input_text", "text": "Hi"}]})
         );
+    }
+
+    #[test]
+    fn a_bounded_body_can_disable_background_without_disabling_storage() {
+        let request = parse(json!({
+            "model": "gpt-5.6-terra",
+            "input": "hello",
+            "stream": true,
+            "max_output_tokens": 128
+        }))
+        .unwrap();
+        let body: Value =
+            serde_json::from_slice(&request.openai_body_with_background(false)).unwrap();
+        assert_eq!(body["background"], false);
+        assert_eq!(body["store"], true);
+        assert_eq!(body["stream"], true);
     }
 
     #[test]

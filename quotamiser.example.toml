@@ -7,9 +7,18 @@
 # Unknown keys stop startup rather than being ignored.
 
 [server]
-# Loopback only. There is no authentication, so this must not be reachable
-# from the network.
+# Loopback by default. LAN access must be enabled explicitly, with both controls.
 bind = "127.0.0.1:8787"
+allow_lan = false
+# To enable LAN access, change bind to your private address (or 0.0.0.0),
+# set allow_lan = true, and uncomment both settings below.
+# Generate a separate token from at least 32 random bytes, encoded as hex.
+# Never reuse an upstream credential. All routes require this Bearer token,
+# even when accessed through loopback in LAN mode.
+# auth_token_env = "QUOTAMISER_LAN_TOKEN"
+# allowed_client_cidrs = ["192.168.1.0/24"]
+# Restrict the host firewall to the same subnet. Use HTTPS via a reverse proxy
+# unless the LAN is trusted and isolated. The native endpoint is HTTP/1.1.
 
 [upstream]
 base_url = "https://api.openai.com/v1"
@@ -125,3 +134,14 @@ refresh_seconds = 120
 data_sharing_ttl_seconds = 900
 # The liability one verification may cover, as a fraction of the day's grant.
 liability_budget_divisor = 4
+# Explicitly capped short responses use synchronous upstream execution. If the
+# client disconnects before usage arrives, the reserved liability is written
+# off instead of waiting for background retrieval. Omitted caps and larger caps
+# keep the safer background recovery path.
+synchronous_max_output_tokens = 512
+# Within the synchronous path, flat text up to this UTF-8 byte size uses the
+# conservative byte bound instead of an input_tokens round trip. Larger or
+# structured inputs still use the exact provider counter. The character limit
+# keeps the window close to a short turn across languages.
+synchronous_max_input_bytes = 4096
+synchronous_max_input_characters = 1024

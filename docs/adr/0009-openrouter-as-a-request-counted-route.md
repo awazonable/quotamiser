@@ -18,7 +18,7 @@ OpenAI の無料枠を使い切ったとき、v1 は 429 を返して終わる�
 
 **共通 ingress → 正規形 → Provider 別 egress policy とする。** OpenAI 向けに組み立てた最終 payload をそのまま OpenRouter へ送らない。
 
-- OpenAI egress は `background: true`・`store: true`・`service_tier: "default"` を付ける（ADR-0002）。
+- OpenAI egress は `store: true`・`service_tier: "default"` を付け、`background` は [ADR-0010](0010-bounded-synchronous-responses.md) の出力上限閾値に従って選ぶ。
 - **OpenRouter egress はそれらを付けず、`store: false`・`stream: true` と、実測で通った形だけを送る。** 測っていない knob（`prompt_cache_key`、`include`、`reasoning.summary` と `reasoning.context`、`text.verbosity`）は落とす。推測で送って 400 を踏めば、貴重な 1 回を捨てることになる。
 
 **OpenRouter の admission は、予約台帳とは別の資源モデル・別の状態機械とする。** 同じ SQLite ファイルの別テーブル（`request_counter` と `request_dispatch`）に置き、接続とトランザクションの補助コードだけを共有する。

@@ -36,6 +36,16 @@ pub struct AdmissionPolicy {
     pub accounting_rev: i64,
     /// Safety inputs every admission depends on, such as `data_sharing`.
     pub required_safety_inputs: Vec<String>,
+    /// An explicit output cap at or below this value may use synchronous
+    /// upstream execution. Unbounded and larger requests retain background
+    /// recovery because a disconnect could otherwise write off a large amount.
+    pub synchronous_max_output_tokens: u64,
+    /// Only flat text up to this UTF-8 byte size may use the unverified byte
+    /// bound in the synchronous path. Other requests use the exact counter.
+    pub synchronous_max_input_bytes: u64,
+    /// Only flat text up to this many Unicode scalar values may use the
+    /// unverified byte bound. Other requests use the exact counter.
+    pub synchronous_max_input_characters: u64,
 }
 
 /// Why a request was not admitted.
@@ -108,12 +118,30 @@ impl Admitter {
             },
             None => InputShape::Structured,
         };
-        let liability = match liability::estimate(
-            &self.policy.estimator,
-            &entry.spec,
-            shape,
-            request.max_output_tokens(),
-        ) {
+        let output_bound = match liability::output_bound(&entry.spec, request.max_output_tokens()) {
+            Ok(bound) => bound,
+            Err(error) => return Decision::Refused(Refused::Estimate(error)),
+        };
+        let background = request.max_output_tokens().is_none()
+            || output_bound > self.policy.synchronous_max_output_tokens;
+        let estimate = if background {
+            liability::estimate(
+                &self.policy.estimator,
+                &entry.spec,
+                shape,
+                request.max_output_tokens(),
+            )
+        } else {
+            liability::estimate_synchronous(
+                &self.policy.estimator,
+                &entry.spec,
+                shape,
+                request.max_output_tokens(),
+                self.policy.synchronous_max_input_characters,
+                self.policy.synchronous_max_input_bytes,
+            )
+        };
+        let liability = match estimate {
             Ok(Liability::Known(liability)) => liability,
             Ok(Liability::NeedsExactInput { output_bound }) => {
                 let mut input_bound: u64 = 0;
@@ -138,7 +166,7 @@ impl Admitter {
             Err(error) => return Decision::Refused(Refused::Estimate(error)),
         };
 
-        let body = Bytes::from(request.openai_body());
+        let body = Bytes::from(request.openai_body_with_background(background));
         let reservation = ReservationRequest {
             pool_id: entry.pool_id.clone(),
             liability,
@@ -153,9 +181,12 @@ impl Admitter {
             .with(move |ledger| ledger.reserve(&reservation, now_unix))
             .await
         {
-            Ok(Admission::Reserved(id)) => {
-                Decision::Admitted(DispatchPermit::new(id, body, self.policy.accounting_rev))
-            }
+            Ok(Admission::Reserved(id)) => Decision::Admitted(DispatchPermit::new(
+                id,
+                body,
+                self.policy.accounting_rev,
+                background,
+            )),
             Ok(Admission::Refused(refusal)) => Decision::Refused(Refused::Ledger(refusal)),
             Err(error) => Decision::Refused(Refused::LedgerUnavailable(error.to_string())),
         }
@@ -298,6 +329,9 @@ mod tests {
                 estimator: EstimatorPolicy::default(),
                 accounting_rev: 1,
                 required_safety_inputs: vec!["data_sharing".into()],
+                synchronous_max_output_tokens: 512,
+                synchronous_max_input_bytes: 4_096,
+                synchronous_max_input_characters: 1_024,
             },
         )
     }
@@ -366,6 +400,53 @@ mod tests {
             state(&ledger, permit.reservation()).await,
             ReservationState::Reserved
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_output_cap_selects_the_low_latency_dispatch_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ledger(dir.path(), GRANT);
+        let (counter, port) = mock_counter(false).await;
+        let admitter = admitter(port, &ledger, false);
+
+        let Decision::Admitted(short) = admitter.admit(&flat(512), 10, Window::Open).await else {
+            panic!("expected a short request to be admitted")
+        };
+        assert!(!short.uses_background());
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 0);
+
+        let Decision::Admitted(long) = admitter.admit(&flat(513), 10, Window::Open).await else {
+            panic!("expected a larger request to be admitted")
+        };
+        assert!(long.uses_background());
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 1);
+
+        let unbounded = parse(json!({
+            "model": "gpt-5.6-terra",
+            "input": "hello",
+            "stream": true
+        }));
+        let Decision::Admitted(unbounded) = admitter.admit(&unbounded, 10, Window::Open).await
+        else {
+            panic!("expected an unbounded request to be admitted")
+        };
+        assert!(unbounded.uses_background());
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 2);
+
+        let mut long_body = json!({
+            "model": "gpt-5.6-terra",
+            "input": "x",
+            "stream": true,
+            "max_output_tokens": 512
+        });
+        long_body["input"] = Value::String("x".repeat(4_097));
+        let long_request = parse(long_body);
+        let Decision::Admitted(long_input) = admitter.admit(&long_request, 10, Window::Open).await
+        else {
+            panic!("expected a bounded long-input request to be admitted")
+        };
+        assert!(!long_input.uses_background());
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -14,10 +14,9 @@
 //!    releases the reservation (ADR-0006); any other refusal holds it.
 //! 4. The response id is attached as soon as it is seen, and the reservation
 //!    is settled from the terminal event's usage.
-//! 5. If the client disconnects before the id is known, the supervisor keeps
-//!    reading upstream for a bounded time to learn it. A background response
-//!    keeps generating after its connection closes, so without the id there
-//!    would be nothing to cancel and nothing to retrieve.
+//! 5. Background responses keep the recovery path after a client disconnect.
+//!    Bounded synchronous responses instead write off their reserved liability
+//!    immediately when the terminal usage cannot be observed.
 //!
 //! Nothing is sent while the provider's rate limit has not reset, or while
 //! it is cooling down after consecutive ambiguous failures; the reservation
@@ -47,21 +46,33 @@ pub struct DispatchPermit {
     reservation: ReservationId,
     body: Bytes,
     accounting_rev: i64,
+    background: bool,
 }
 
 impl DispatchPermit {
     /// Binds a reservation to the exact canonical body its liability was
     /// computed for. Only admission, which holds the reservation, makes one.
-    pub(crate) fn new(reservation: ReservationId, body: Bytes, accounting_rev: i64) -> Self {
+    pub(crate) fn new(
+        reservation: ReservationId,
+        body: Bytes,
+        accounting_rev: i64,
+        background: bool,
+    ) -> Self {
         Self {
             reservation,
             body,
             accounting_rev,
+            background,
         }
     }
 
     pub fn reservation(&self) -> ReservationId {
         self.reservation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_background(&self) -> bool {
+        self.background
     }
 }
 
@@ -111,6 +122,9 @@ pub enum Disposition {
     },
     /// Sent with no id to recover; written off at its deadline.
     HeldAsUnknown,
+    /// A bounded synchronous request disconnected before authoritative usage
+    /// arrived, so its reserved liability was consumed immediately.
+    WrittenOff,
     ReleasedUnsent,
     /// Sent and refused before processing started.
     ReleasedRejected,
@@ -186,6 +200,7 @@ async fn supervise(
         reservation,
         body,
         accounting_rev,
+        background,
     } = permit;
     let mut head_tx = Some(head_tx);
 
@@ -245,6 +260,7 @@ async fn supervise(
                 &policy,
                 reservation,
                 accounting_rev,
+                background,
                 response,
                 head_tx,
             )
@@ -294,6 +310,7 @@ async fn relay(
     policy: &DispatchPolicy,
     reservation: ReservationId,
     accounting_rev: i64,
+    background: bool,
     mut response: Response,
     mut head_tx: Option<oneshot::Sender<Head>>,
 ) -> Disposition {
@@ -313,6 +330,13 @@ async fn relay(
 
     loop {
         if downstream.is_none() && settled.is_none() {
+            if !background {
+                let disposition = match ledger.with(move |l| l.write_off(reservation)).await {
+                    Ok(()) => Disposition::WrittenOff,
+                    Err(error) => Disposition::LedgerFailed(error.to_string()),
+                };
+                return disposition;
+            }
             if let Some(id) = &response_id {
                 // Stop generation. What it consumed is settled by retrieval.
                 let _ = upstream.cancel(id).await;
@@ -378,6 +402,13 @@ async fn relay(
     // Upstream ended the stream, cleanly or not, before its terminal event.
     if settled.is_none() {
         breaker.record_ambiguous_failure(Instant::now());
+        if !background {
+            let disposition = match ledger.with(move |l| l.write_off(reservation)).await {
+                Ok(()) => Disposition::WrittenOff,
+                Err(error) => Disposition::LedgerFailed(error.to_string()),
+            };
+            return disposition;
+        }
     }
     match (settled, response_id) {
         (Some(settlement), _) => Disposition::Settled(settlement),
@@ -684,7 +715,11 @@ mod tests {
     }
 
     fn permit(id: ReservationId) -> DispatchPermit {
-        DispatchPermit::new(id, Bytes::from_static(b"{}"), 1)
+        DispatchPermit::new(id, Bytes::from_static(b"{}"), 1, true)
+    }
+
+    fn synchronous_permit(id: ReservationId) -> DispatchPermit {
+        DispatchPermit::new(id, Bytes::from_static(b"{}"), 1, false)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -880,6 +915,29 @@ mod tests {
             (LIABILITY as i64, 0),
             "nothing is released until retrieval settles it"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bounded_synchronous_disconnect_writes_off_without_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, id) = reserved_ledger(dir.path());
+        let (mock, port) = mock_upstream(Mode::CreatedAfter(Duration::from_secs(1))).await;
+
+        let dispatched = dispatcher(port, &ledger, Duration::from_secs(3))
+            .dispatch(synchronous_permit(id))
+            .await;
+        drop(dispatched.head);
+
+        assert_eq!(
+            dispatched.supervisor.await.unwrap(),
+            Disposition::WrittenOff
+        );
+        assert_eq!(mock.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state(&ledger, id).await,
+            ReservationState::ConsumedUnrecoverable
+        );
+        assert_eq!(counters(&ledger).await, (0, LIABILITY as i64));
     }
 
     #[tokio::test(flavor = "multi_thread")]

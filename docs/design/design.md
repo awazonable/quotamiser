@@ -39,7 +39,7 @@ consumed[p,e] + Σ( 活性な予約行の liability )[p,e]  <=  granted[p,e]
         client (OpenAI 互換)
               │
     ┌─────────▼──────────┐
-    │ Ingress            │  正規化・allowlist・機能適合判定
+    │ Ingress            │  接続元・認証 → 正規化・allowlist・機能適合判定
     └─────────┬──────────┘
               │ 正規化済みリクエスト（不変）
     ┌─────────▼──────────┐      ┌──────────────────┐
@@ -66,6 +66,45 @@ consumed[p,e] + Σ( 活性な予約行の liability )[p,e]  <=  granted[p,e]
     │ 期限＋負債予算 │ │ 永続      │ │ 無課金の時刻取得 │
     └──────────────┘ └──────────┘ └─────────────────┘
 ```
+
+### LAN 接続の境界（ADR-0011）
+
+LAN 接続は `crates/proxy/src/lan.rs` に実装する。`Config::resolve` が設定と token を検証し、起動処理が `server::router` 全体を LAN middleware で包む。既定と既存のローカル設定は loopback のまま使う。
+
+#### 設定と起動
+
+`[server]` に次を追加する。設定ファイルの未知のキーを拒否する既存の方針を維持する。
+
+- `allow_lan` — 既定 `false`。非 loopback の bind には `true` を要求する。
+- `auth_token_env` — LAN 用共有 token を保持する環境変数名。LAN モードでは必須。`.env` の既存の読込機構を使い、値は設定ファイルに置かない。
+- `allowed_client_cidrs` — LAN モードで必須の空でない配列。RFC 1918 の IPv4 private range または IPv6 ULA の内側に収まる CIDR のみ受け付ける。loopback peer は暗黙に許可するが、認証は省略しない。
+
+`allow_lan = false` は従来どおり loopback のみ許可し、LAN 用設定が付いていれば設定不整合として拒否する。`allow_lan = true` は private IPv4、IPv6 ULA、loopback、または wildcard bind を許可する。wildcard は全 interface で待ち受けるため、peer の CIDR 制限を必ず適用する。公開アドレスへの明示的な bind は拒否する。IPv4-mapped IPv6 peer は IPv4 に正規化して判定する。
+
+LAN token は暗号学的乱数 32 バイト以上を hex で表した値（64 桁以上、偶数桁）とする。未設定・空・形式不正は listener を開く前に拒否する。設定値の形式検証は乱数品質の証明ではないため、運用手順で乱数からの生成を要求する。OpenAI / Admin / OpenRouter credential と同じ値も拒否する。token は debug 出力しない専用の秘密値として保持し、比較には定数時間比較を使う。変更は設定変更と再起動で反映する。
+
+#### HTTP の処理順序
+
+axum の接続情報で TCP peer を取得し、LAN モードでは全 route に適用する middleware を本文 extractor の外側に置く。
+
+1. peer を正規化し、loopback または設定 CIDR に一致するか確認する。接続情報が無い場合も拒否する。`Forwarded` / `X-Forwarded-For` は信用しない。
+2. `Origin` があれば拒否する。CORS 許可ヘッダを返さず、ブラウザ preflight を許可しない。
+3. Authorization が単一の Bearer credential であることを確認し、共有 token と照合する。欠落、不正、複数の Authorization 値は 401 とし、`WWW-Authenticate: Bearer` と OpenAI 互換の `authentication_error` を返す。peer / Origin の拒否は 403 とする。
+4. 認証成功後だけ、上限付きの本文読込・正規化・admission・dispatch を行う。認証の拒否から OpenRouter / Local へ fallback しない。
+
+ingress の Authorization は上流 payload とヘッダに含めない。上流通信は従来どおり provider 専用 credential を使用する。ログには token、Authorization、`.env` の値を含めない。
+
+LAN モードでは同時 HTTP 接続と処理中の要求をそれぞれ全体で 32 までとし、超過接続は閉じ、超過要求は本文を読まず 429 で拒否する。要求の枠は SSE 本文の終了まで保持する。既存の axum 構成と同じ HTTP/1.1 を提供し、HTTP/2 の接続 preface を拒否する。TLS proxy が HTTP/2 を受ける場合も backend へは HTTP/1.1 で送る。HTTP/2 の受理は将来の独立した変更とする。
+
+ヘッダ受信と keep-alive の idle は各 30 秒、本文を持つ要求はヘッダ受信完了から 30 秒で読込を打ち切り、予約前に拒否する。LAN listener は hyper の HTTP/1 接続に header timeout を設定し、middleware が本文を timeout 付きで上限まで読み切る。既存の 64 MiB 本文上限は維持する。応答 SSE の途中にはこれらの受信・idle 期限を適用しない。送信後の切断は既存の監督タスクが扱い、同期経路の write-off と background 経路の回収を維持する。
+
+#### 配置と移行
+
+信頼する隔離 LAN ではホストの private address を bind に指定する構成を優先し、firewall に同じ接続元範囲を設定する。クライアントはそのホストの LAN address を base URL に使い、専用 token を Authorization に設定する。複数端末も単一 Runtime と台帳を共有し、端末ごとの quota は設けない。
+
+HTTPS が必要な環境では、TLS reverse proxy を同じホストに配置し、QuotaMiser 側は `allow_lan = true` の loopback bind にする。proxy は接続元制限を担当し、Authorization を QuotaMiser に渡す。QuotaMiser も token を検証するが、peer は proxy の loopback なので LAN 接続元の保証は proxy と firewall が担う。SSE の buffering を無効化し、stream を途中で打ち切る短い応答 timeout を避ける。ネイティブ TLS と forwarded-header trust は追加しない。
+
+実装順序は設定検証 → peer / Origin / 認証 middleware → 接続・要求数と受信期限 → 設定例・クライアント手順の更新とする。欠落・不正 token、複数 Authorization、Origin、CIDR 外、偽装 forwarded ヘッダが handler に到達しないことをテストする。IPv4 / IPv6、wildcard、loopback 互換、正常な models と SSE、LAN 切断後の精算、接続・要求上限、HTTP/2 の拒否、遅いヘッダと本文の拒否を確認する。運用時には別端末からの実接続と firewall の拒否も検証する。
 
 ### 予約 capability
 
@@ -99,7 +138,9 @@ input_bound = Σ( 正規化後の対象文字列すべての UTF-8 バイト長 
 
 バイト単位 BPE は基本語彙に 256 バイト値をすべて含み、マージは token 数を減らす方向にしか働かないため、`本文の tokens <= 本文の UTF-8 バイト長` が encoding によらず成立する。
 
-**確定経路** — 上記以外はすべて `POST /v1/responses/input_tokens` で数え、返った値の合計を `input_bound` とする。この endpoint は実測で無課金・無枠消費である。
+**確定経路** — background 経路、および同期経路でも後述の限定条件を満たさないものは、`POST /v1/responses/input_tokens` で数え、返った値の合計を `input_bound` とする。この endpoint は実測で無課金・無枠消費である。
+
+明示的な短い出力上限を持つ同期経路では、平坦なテキスト入力の合計が設定した入力バイト上限と Unicode 文字数上限の両方以下であれば、`input_tokens` の往復を省く。本文の UTF-8 バイト長と framing allowance を入力上界とする、encoding 未確認の低遅延モードである。上限を超える入力や構造化入力は厳密カウントへ戻す。文字数はトークン数の保証ではない。
 
 数える本文は `CreateRequest::input_count_bodies` が決める。リクエストそのものに加え、`additional_tools` 項目ごとに、その tool を上位の `tools` として宣言した本文を 1 つ加える。この endpoint は `additional_tools` の tool を生成時より 1 回少なく数えることを実測したためである（[ADR-0008](../adr/0008-count-additional-tools-twice.md)）。他の受理する形では、数えた値と生成時の値が一致した。
 
@@ -116,7 +157,7 @@ input_bound = Σ( 正規化後の対象文字列すべての UTF-8 バイト長 
 
 判定は `CreateRequest::flat_text` が行う。
 
-**満たさないものはすべて確定経路へ送る。** 「plain text」という括りでは、1 個の最上位メッセージが多数の content part を含む形を通してしまい、上流の書式トークンは part ごとに増えて上界が破れる。
+**満たさないものはすべて確定経路へ送る。** 「plain text」という括りでは、1 個の最上位メッセージが多数の content part を含む形を通してしまい、上流の書式トークンは part ごとに増えて上界が破れる。低遅延モードでもこの条件は変えない。
 
 書式トークン許容量は `input_tokens` との突き合わせで測定し、観測値に余裕を取った定数とする。平坦形ではノード数が固定されるためこの定数の影響は小さい。
 
@@ -161,7 +202,7 @@ async Rust では「await の順序」で守れる境界ではない。HTTP ク�
 - 受け口はリクエスト本文を上限付きで最初に読み切る。未読の大きな本文を保持していると切断が検知されない。
 - reqwest の `.send()` は最初の poll まで何も送らない。`DISPATCHING` は最初の poll の前に永続化する。
 - 送信後の接続エラーは、上流が要求全体を受け取っていても起こりうる。結果不明として扱い、予約を解放しない。
-- **`response.created` を受け取る前に下流が切断した場合、上流との接続をすぐには閉じない。** background で発行した応答は接続を閉じても生成が続く（2026-09-09 実測）ため、id を得る前に閉じると cancel も回収もできず、上流の生成が最後まで枠を消費する。上限付きの時間だけ `response.created` を待ち、id を得たら cancel する。待ちきれなければ接続を閉じて `DISPATCHED_ID_UNKNOWN` とする。
+- **回収経路のリクエストで `response.created` を受け取る前に下流が切断した場合、上流との接続をすぐには閉じない。** background で発行した応答は接続を閉じても生成が続く（2026-09-09 実測）ため、id を得る前に閉じると cancel も回収もできず、上流の生成が最後まで枠を消費する。上限付きの時間だけ `response.created` を待ち、id を得たら cancel する。待ちきれなければ接続を閉じて `DISPATCHED_ID_UNKNOWN` とする。同期経路の明示的な上限付きリクエストは、回収を待たず予約全額を `CONSUMED_UNRECOVERABLE` とする。
 
 ## 永続モデル
 
@@ -387,7 +428,7 @@ Usage API は**ドリフトの検出にのみ**用いる。`台帳.consumed` が
 
 共通に必要な能力は「このリクエストを受けられるかの判定」と「予約 capability を伴う送信」である。**トレイトの形は移植元を見てから決める。** 台帳の抽象化はしない（要件の非目標）。
 
-- **OpenAI**: Responses API、`background: true`、`store: true`。予約・精算・回収の全機構が付く。
+- **OpenAI**: Responses API。未指定または設定した閾値を超える `max_output_tokens` は `background: true`、`store: true` とし、予約・精算・回収の全機構を付ける。明示された上限が閾値以下なら `background: false`、`store: true` の同期経路とし、切断時は予約全額を `CONSUMED_UNRECOVERABLE` とする（[ADR-0010](../adr/0010-bounded-synchronous-responses.md)）。
 - **OpenRouter**: トークン台帳を持たない。**1 日 50 回・1 分 20 回の回数建て**であり、送信前に 1 回ぶんを確保して原則戻さない（失敗したリクエストも枠を消費するため、ADR-0009）。Responses API で送るが、`store: false` とし `background` と `service_tier` は付けない。`:free` と `openrouter/free` の完全一致 allowlist に加え、**モデルごとの実測 capability で送信前に適合を判定する**（`custom` tool は通らない）。402 は provider を閉じて次へ。
 - **Local (FreeToken Desktop)**: 枠が無い。`GET /health` で `ok` / `loading` / `error` を判定し、`loading` は down として扱わない。**同時実行を自前で数え**、上限超過は送信前に拒否する。retrieve は試みない。
 

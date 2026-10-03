@@ -199,6 +199,9 @@ impl Runtime {
                 estimator: EstimatorPolicy::default(),
                 accounting_rev: ACCOUNTING_REV,
                 required_safety_inputs: vec![DATA_SHARING.to_string()],
+                synchronous_max_output_tokens: resolved.synchronous_max_output_tokens,
+                synchronous_max_input_bytes: resolved.synchronous_max_input_bytes,
+                synchronous_max_input_characters: resolved.synchronous_max_input_characters,
             },
         );
         let dispatcher = Dispatcher::new(
@@ -542,6 +545,10 @@ mod tests {
     static REPORTED_TOKENS: Mutex<u64> = Mutex::new(0);
 
     async fn mock_provider() -> String {
+        mock_provider_counted(Arc::new(std::sync::atomic::AtomicUsize::new(0))).await
+    }
+
+    async fn mock_provider_counted(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
         let app = Router::new()
             .route(
                 "/v1/models",
@@ -569,7 +576,16 @@ mod tests {
                     }))
                 }),
             )
-            .with_state(());
+            .with_state(())
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        next.run(request).await
+                    }
+                },
+            ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -590,6 +606,7 @@ mod tests {
     fn resolved(base: &str, dir: &Path) -> Resolved {
         Resolved {
             bind: "127.0.0.1:0".parse().unwrap(),
+            lan: None,
             upstream: UpstreamConfig {
                 base_url: base.to_string(),
                 api_key: "sk-test".into(),
@@ -605,6 +622,9 @@ mod tests {
             clock_refresh: Duration::from_secs(3_600),
             data_sharing_ttl: 900,
             safety_budget_divisor: 4,
+            synchronous_max_output_tokens: 512,
+            synchronous_max_input_bytes: 4_096,
+            synchronous_max_input_characters: 1_024,
             grants: vec![(POOL.to_string(), 2_500_000)],
             openrouter: None,
             catalog: HashMap::from([(
@@ -634,6 +654,96 @@ mod tests {
             .unwrap()
             .expect("the pool is open")
             .consumed
+    }
+
+    #[tokio::test]
+    async fn lan_denials_leave_runtime_ledger_and_provider_untouched() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_provider_counted(calls.clone()).await;
+        let runtime = Arc::new(Runtime::start(resolved(&base, dir.path())).await.unwrap());
+        let epoch = epoch_of(runtime.trusted_now().unwrap());
+        let before = runtime
+            .ledger()
+            .with(move |ledger| ledger.counters(POOL, epoch))
+            .await
+            .unwrap();
+        let before_calls = calls.load(Ordering::SeqCst);
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let access = crate::lan::build_access(
+            &crate::config::Server {
+                bind: "127.0.0.1:0".into(),
+                allow_lan: true,
+                auth_token_env: Some("UNUSED_TEST_ENV".into()),
+                allowed_client_cidrs: vec!["192.168.1.0/24".into()],
+            },
+            token.into(),
+        )
+        .unwrap();
+        let app = crate::lan::protect(crate::server::router(runtime.clone()), access);
+        for (peer, authorization, origin, expected) in [
+            ("127.0.0.1:1", None, None, StatusCode::UNAUTHORIZED),
+            ("127.0.0.1:1", Some("wrong"), None, StatusCode::UNAUTHORIZED),
+            ("192.168.2.1:1", Some(token), None, StatusCode::FORBIDDEN),
+            (
+                "127.0.0.1:1",
+                Some(token),
+                Some("http://example.com"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder().method("POST").uri("/v1/responses")
+                .body(Body::from(json!({"model": MODEL, "stream": true, "input": "hello", "max_output_tokens": 64}).to_string())).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+            if let Some(token) = authorization {
+                request
+                    .headers_mut()
+                    .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            }
+            if let Some(origin) = origin {
+                request
+                    .headers_mut()
+                    .insert("origin", origin.parse().unwrap());
+            }
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        assert_eq!(
+            runtime
+                .ledger()
+                .with(move |ledger| ledger.counters(POOL, epoch))
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .extension(ConnectInfo(
+                        "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

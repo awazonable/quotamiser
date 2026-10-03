@@ -146,6 +146,65 @@ pub fn estimate(
     }
 }
 
+/// Estimates a synchronous, short response without the provider counter when
+/// the input is a small flat text request. This deliberately uses the UTF-8
+/// byte bound even when the model's encoding is not in the trusted table. It
+/// is a latency/safety trade-off for bounded requests: byte-fallback BPEs stay
+/// within this bound, while an unexpected encoding is caught by settlement's
+/// usage overrun latch.
+pub fn estimate_synchronous(
+    policy: &EstimatorPolicy,
+    spec: &ModelSpec,
+    shape: InputShape<'_>,
+    requested_cap: Option<u64>,
+    max_input_characters: u64,
+    max_input_bytes: u64,
+) -> Result<Liability, EstimateError> {
+    let output_bound = output_bound(spec, requested_cap)?;
+    let InputShape::FlatText {
+        instructions,
+        input,
+    } = shape
+    else {
+        return estimate(policy, spec, shape, requested_cap);
+    };
+
+    let text_bytes = instructions
+        .into_iter()
+        .chain(std::iter::once(input))
+        .try_fold(0u64, |sum, text| sum.checked_add(text.len() as u64))
+        .ok_or(EstimateError::Overflow)?;
+    let text_characters = instructions
+        .into_iter()
+        .chain(std::iter::once(input))
+        .try_fold(0u64, |sum, text| {
+            sum.checked_add(text.chars().count() as u64)
+        })
+        .ok_or(EstimateError::Overflow)?;
+    if text_characters > max_input_characters || text_bytes > max_input_bytes {
+        return estimate(
+            policy,
+            spec,
+            InputShape::FlatText {
+                instructions,
+                input,
+            },
+            requested_cap,
+        );
+    }
+
+    let node_count = u64::from(instructions.is_some()) + 1;
+    let framing = policy
+        .framing_allowance_per_node
+        .checked_mul(node_count)
+        .ok_or(EstimateError::Overflow)?;
+    text_bytes
+        .checked_add(framing)
+        .and_then(|input_bound| input_bound.checked_add(output_bound))
+        .map(Liability::Known)
+        .ok_or(EstimateError::Overflow)
+}
+
 /// Completes a liability once the provider has counted the input: the sum of
 /// its counts over the count bodies, never a single count of the request.
 pub fn with_exact_input(exact_input_tokens: u64, output_bound: u64) -> Result<u64, EstimateError> {
@@ -231,6 +290,55 @@ mod tests {
         assert_eq!(
             estimate(&policy(), &UNKNOWN, flat, Some(10)),
             Ok(Liability::NeedsExactInput { output_bound: 10 })
+        );
+    }
+
+    #[test]
+    fn synchronous_short_flat_text_may_use_the_utf8_byte_bound() {
+        let flat = InputShape::FlatText {
+            instructions: None,
+            input: "日本語",
+        };
+        assert_eq!(
+            estimate_synchronous(&policy(), &UNKNOWN, flat, Some(16), 64, 64),
+            Ok(Liability::Known(9 + 64 + 16))
+        );
+    }
+
+    #[test]
+    fn synchronous_byte_bound_falls_back_for_long_or_structured_input() {
+        let long = InputShape::FlatText {
+            instructions: None,
+            input: "hello",
+        };
+        assert_eq!(
+            estimate_synchronous(&policy(), &UNKNOWN, long, Some(16), 4, 64),
+            Ok(Liability::NeedsExactInput { output_bound: 16 })
+        );
+        assert_eq!(
+            estimate_synchronous(
+                &policy(),
+                &UNKNOWN,
+                InputShape::FlatText {
+                    instructions: None,
+                    input: "日本語",
+                },
+                Some(16),
+                64,
+                8,
+            ),
+            Ok(Liability::NeedsExactInput { output_bound: 16 })
+        );
+        assert_eq!(
+            estimate_synchronous(
+                &policy(),
+                &UNKNOWN,
+                InputShape::Structured,
+                Some(16),
+                64,
+                64,
+            ),
+            Ok(Liability::NeedsExactInput { output_bound: 16 })
         );
     }
 
